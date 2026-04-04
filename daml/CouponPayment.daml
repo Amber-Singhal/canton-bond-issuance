@@ -1,0 +1,202 @@
+module CouponPayment where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+import DA.Set as Set
+import DA.Optional (isSome)
+import Bond (Bond)
+import BondIssuance (BondHolding)
+
+-- | Represents the obligation for a paying agent to disburse a scheduled coupon payment.
+-- This contract is typically created by the issuer or the agent before the payment date.
+template CouponPaymentObligation
+  with
+    payingAgent: Party
+      -- ^ The party responsible for executing the payment.
+    issuer: Party
+      -- ^ The issuer of the bond, who funds the payment.
+    investors: [Party]
+      -- ^ The list of current bondholders who will be observers of this obligation.
+    bondCid: ContractId Bond
+      -- ^ The contract ID of the underlying bond.
+    paymentDate: Date
+      -- ^ The scheduled date for this coupon payment.
+    holdingCids: [ContractId BondHolding]
+      -- ^ A list of active bond holding contracts. The choice will fetch these at
+      -- payment time to ensure the correct, current owners are paid.
+  where
+    signatory payingAgent, issuer
+    observer investors
+
+    key (issuer, bondCid, paymentDate) : (Party, ContractId Bond, Date)
+    maintainer key._1
+
+    -- | Choice exercised by the paying agent to process the coupon payment for all
+    -- current bondholders. This consumes the obligation and creates payment receipts.
+    choice DistributeCouponPayment: ()
+      with
+        paymentTime: Time
+          -- ^ The timestamp of the payment execution.
+      controller payingAgent
+      do
+        -- Ensure payment is not made before the due date
+        let today = date (year paymentTime) (month paymentTime) (day paymentTime)
+        assertMsg ("Payment cannot be made before the scheduled date of " <> show paymentDate) $
+          paymentDate <= today
+
+        bond <- fetch bondCid
+
+        -- Process payment for each holding
+        forA_ holdingCids (\holdingCid -> do
+          -- Fetch the holding to get the current investor and face value.
+          -- This ensures we are paying the current owner of the bond holding.
+          holding <- fetch holdingCid
+
+          -- Ensure the holding is for the correct bond
+          assertMsg "Bond holding does not match the bond in the payment obligation."
+            (holding.bondCid == bondCid)
+
+          -- Calculate the coupon amount for this specific holding
+          let couponsPerYear = case bond.couponFrequency of
+                "ANNUALLY" -> 1.0
+                "SEMIANNUALLY" -> 2.0
+                "QUARTERLY" -> 4.0
+                _ -> abort ("Unsupported coupon frequency: " <> bond.couponFrequency)
+
+          let paymentAmount = holding.faceValue * bond.couponRate / couponsPerYear
+
+          -- Create a receipt for the investor, representing the successful payment
+          create CouponPaymentReceipt with
+            payingAgent = payingAgent
+            issuer = issuer
+            investor = holding.investor
+            bondCid = bondCid
+            paymentDate = paymentDate
+            paidAt = paymentTime
+            couponAmount = paymentAmount
+            holdingFaceValue = holding.faceValue
+          )
+        pure ()
+
+-- | A record confirming that a coupon payment was made to an investor.
+-- This serves as a verifiable receipt on the ledger between the agent and investor.
+template CouponPaymentReceipt
+  with
+    payingAgent: Party
+      -- ^ The party that made the payment.
+    issuer: Party
+      -- ^ The bond issuer.
+    investor: Party
+      -- ^ The party that received the payment.
+    bondCid: ContractId Bond
+      -- ^ The contract ID of the underlying bond.
+    paymentDate: Date
+      -- ^ The scheduled payment date of the coupon.
+    paidAt: Time
+      -- ^ The actual timestamp when the payment was processed.
+    couponAmount: Decimal
+      -- ^ The amount paid to the investor.
+    holdingFaceValue: Decimal
+      -- ^ The face value of the bonds held by the investor for this payment period.
+  where
+    signatory payingAgent, investor
+    observer issuer
+
+    key (investor, bondCid, paymentDate) : (Party, ContractId Bond, Date)
+    maintainer key._1
+
+-- Note: The following script requires Bond.daml and BondIssuance.daml to be present.
+-- It is for demonstration and testing of the coupon payment workflow.
+-- To run it: `daml test --test-name "testCouponPaymentWorkflow" daml/CouponPayment.daml`
+testCouponPaymentWorkflow: Script ()
+testCouponPaymentWorkflow = script do
+  -- Parties
+  issuer <- allocateParty "Issuer"
+  payingAgent <- allocateParty "PayingAgent"
+  investor1 <- allocateParty "Investor1"
+  investor2 <- allocateParty "Investor2"
+
+  -- Time and Date
+  now <- getTime
+  let today = date (year now) (month now) (day now)
+  let maturity = addDays today 365
+  let couponPaymentDate = addDays today 180
+
+  -- 1. Create a Bond contract (defined in Bond.daml)
+  bondCid <- submit issuer do
+    createCmd Bond with
+      issuer = issuer
+      isin = "US1234567890"
+      description = "Sample Corporate Bond"
+      currency = "USD"
+      faceValue = 1000.0
+      couponRate = 0.05 -- 5% annual rate
+      couponFrequency = "SEMIANNUALLY"
+      issueDate = today
+      maturityDate = maturity
+      payingAgent = payingAgent
+      observers = Set.empty
+
+  -- 2. Create BondHolding contracts for investors (defined in BondIssuance.daml)
+  holding1Cid <- submitMulti [issuer, investor1] [] do
+    createCmd BondHolding with
+      issuer = issuer
+      investor = investor1
+      bondCid = bondCid
+      faceValue = 50000.0
+
+  holding2Cid <- submitMulti [issuer, investor2] [] do
+    createCmd BondHolding with
+      issuer = issuer
+      investor = investor2
+      bondCid = bondCid
+      faceValue = 100000.0
+
+  -- 3. Issuer and Paying Agent create the CouponPaymentObligation
+  let allHoldingCids = [holding1Cid, holding2Cid]
+  let allInvestors = [investor1, investor2]
+  obligationCid <- submitMulti [issuer, payingAgent] [] do
+    createCmd CouponPaymentObligation with
+      payingAgent = payingAgent
+      issuer = issuer
+      investors = allInvestors
+      bondCid = bondCid
+      paymentDate = couponPaymentDate
+      holdingCids = allHoldingCids
+
+  -- 4. Fast-forward time to payment day
+  let paymentTime = time couponPaymentDate 10 0 0
+  passTime (subTime paymentTime now)
+
+  -- 5. Paying Agent executes the coupon payment distribution
+  submit payingAgent do
+    exerciseCmd obligationCid DistributeCouponPayment with paymentTime
+
+  -- 6. Verify receipts were created and obligation is archived
+  obligation <- queryContractId @CouponPaymentObligation payingAgent obligationCid
+  assertMsg "CouponPaymentObligation should be archived after distribution" (obligation == None)
+
+  receipt1Opt <- queryContractKey @CouponPaymentReceipt investor1 (investor1, bondCid, couponPaymentDate)
+  assert (isSome receipt1Opt)
+
+  receipt2Opt <- queryContractKey @CouponPaymentReceipt investor2 (investor2, bondCid, couponPaymentDate)
+  assert (isSome receipt2Opt)
+
+  -- 7. Validate payment amounts in receipts
+  let expectedAmount1 = 50000.0 * 0.05 / 2.0 -- 1250.0
+  let expectedAmount2 = 100000.0 * 0.05 / 2.0 -- 2500.0
+
+  case receipt1Opt of
+    Some (_cid, contract) -> do
+      assert (contract.couponAmount == expectedAmount1)
+      debug $ "OK: Investor1 received correct coupon payment of " <> show contract.couponAmount
+    None -> abort "Receipt for Investor1 not found"
+
+  case receipt2Opt of
+    Some (_cid, contract) -> do
+      assert (contract.couponAmount == expectedAmount2)
+      debug $ "OK: Investor2 received correct coupon payment of " <> show contract.couponAmount
+    None -> abort "Receipt for Investor2 not found"
+
+  pure ()
