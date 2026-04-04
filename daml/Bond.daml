@@ -1,0 +1,265 @@
+module Bond where
+
+import DA.Date
+import DA.List (sum, head, tail, all, forA)
+import DA.Set (member, fromList)
+import DA.Time (getTime, date, year, month, day)
+import Daml.Script
+
+-- | Defines the frequency of coupon payments.
+data CouponFrequency = Annually | SemiAnnually | Quarterly | Monthly
+  deriving (Eq, Show)
+
+-- | Converts coupon frequency to the number of months between payments.
+monthsPerPeriod : CouponFrequency -> Int
+monthsPerPeriod Annually = 12
+monthsPerPeriod SemiAnnually = 6
+monthsPerPeriod Quarterly = 3
+monthsPerPeriod Monthly = 1
+
+-- | Static data that defines a bond instrument.
+-- This data type is intended to be embedded in other templates.
+data BondInstrument = BondInstrument
+  with
+    isin: Text
+    issuer: Party
+    description: Text
+    currency: Text
+    faceValue: Decimal
+    couponRate: Decimal
+    couponFrequency: CouponFrequency
+    issueDate: Date
+    maturityDate: Date
+    couponDates: [Date]
+    payingAgent: Party
+    observers: [Party]
+  deriving (Eq, Show)
+
+-- | Helper function to generate a list of coupon payment dates for a bond.
+-- It calculates dates backwards from the maturity date.
+calculateCouponDates: Date -> Date -> CouponFrequency -> [Date]
+calculateCouponDates issueDate maturityDate freq =
+  let
+    months = monthsPerPeriod freq
+    go : Date -> [Date] -> [Date]
+    go currentDate acc =
+      if currentDate > issueDate then
+        let prevDate = addMonths (-months) currentDate
+        in go prevDate (currentDate :: acc)
+      else
+        acc
+  in go maturityDate []
+
+
+-- | Represents the initial offering of a bond by an issuer.
+-- Investors can subscribe to this issuance to receive `BondHolding` contracts.
+template BondIssuance
+  with
+    instrument: BondInstrument
+    maxIssuanceAmount: Decimal
+    currentIssuanceAmount: Decimal
+    issuanceCloseDate: Date
+    subscribers: [Party]
+  where
+    signatory instrument.issuer
+    observer (instrument.payingAgent :: instrument.observers)
+
+    ensure instrument.maturityDate > instrument.issueDate
+      && instrument.couponRate >= 0.0
+      && instrument.faceValue > 0.0
+      && maxIssuanceAmount > 0.0
+      && currentIssuanceAmount >= 0.0
+      && currentIssuanceAmount <= maxIssuanceAmount
+
+    key (instrument.issuer, instrument.isin) : (Party, Text)
+    maintainer key._1
+
+    choice Subscribe : ContractId BondHolding
+      -- Allows an investor to subscribe to the bond issuance.
+      with
+        investor: Party
+        custodian: Party
+        quantity: Decimal -- Number of bond units, not the total value
+      controller investor
+      do
+        -- Subscription must happen before or on the closing date.
+        time <- getTime
+        let today = date (year time) (month time) (day time)
+        assertMsg "Subscription window is closed" (today <= issuanceCloseDate)
+
+        -- Basic validation for the subscription amount.
+        assertMsg "Subscription quantity must be positive" (quantity > 0.0)
+        let subscriptionValue = quantity * instrument.faceValue
+        assertMsg "Subscription amount exceeds available issuance amount"
+          (currentIssuanceAmount + subscriptionValue <= maxIssuanceAmount)
+
+        -- Update the issuance contract state.
+        create this with
+          currentIssuanceAmount = currentIssuanceAmount + subscriptionValue
+          subscribers = if member investor (fromList subscribers) then subscribers else investor :: subscribers
+
+        -- Create the bond holding for the investor.
+        create BondHolding with
+          instrument = instrument
+          owner = investor
+          custodian = custodian
+          quantity = quantity
+          acquisitionDate = today
+
+-- | Represents an investor's holding of a specific bond instrument.
+-- This is the primary on-ledger asset.
+template BondHolding
+  with
+    instrument: BondInstrument
+    owner: Party
+    custodian: Party
+    quantity: Decimal
+    acquisitionDate: Date
+  where
+    signatory instrument.issuer, owner, custodian
+    observer (instrument.payingAgent :: instrument.observers)
+
+    ensure quantity > 0.0
+
+    key (instrument.isin, owner, custodian) : (Text, Party, Party)
+    maintainer key._2
+
+    choice Propose_Transfer : ContractId TransferProposal
+      -- Proposes to transfer the bond holding to a new owner.
+      -- This follows the standard proposal-acceptance pattern.
+      with
+        newOwner: Party
+      controller owner
+      do
+        create TransferProposal with
+          holdingCid = self
+          instrument = instrument
+          owner = owner
+          custodian = custodian
+          quantity = quantity
+          newOwner = newOwner
+
+    choice Split : [ContractId BondHolding]
+      -- Splits the holding into multiple smaller holdings.
+      with
+        amounts: [Decimal]
+      controller owner
+      do
+        assertMsg "Sum of split amounts must equal the total quantity" (sum amounts == quantity)
+        assertMsg "All split amounts must be positive" (all (\a -> a > 0.0) amounts)
+        archive self
+        forA amounts (\amount ->
+          create this with quantity = amount
+          )
+
+-- | A proposal to transfer a `BondHolding` from one owner to another.
+template TransferProposal
+  with
+    holdingCid: ContractId BondHolding
+    instrument: BondInstrument
+    owner: Party
+    custodian: Party
+    quantity: Decimal
+    newOwner: Party
+  where
+    signatory owner
+    observer newOwner
+
+    choice Accept_Transfer : ContractId BondHolding
+      -- The new owner accepts the transfer.
+      controller newOwner
+      do
+        time <- getTime
+        let today = date (year time) (month time) (day time)
+
+        -- The original holding is archived and a new one is created.
+        archive holdingCid
+        create BondHolding with
+          instrument = instrument
+          owner = newOwner
+          custodian = custodian
+          quantity = quantity
+          acquisitionDate = today
+
+    choice Reject_Transfer : ()
+      -- Either party can reject the transfer proposal.
+      controller owner, newOwner
+      do
+        archive self
+
+-- Main setup script for demonstration purposes.
+setup : Script ()
+setup = script do
+  -- Parties
+  issuer <- allocateParty "Issuer"
+  investor1 <- allocateParty "Investor1"
+  investor2 <- allocateParty "Investor2"
+  custodian <- allocateParty "Custodian"
+  payingAgent <- allocateParty "PayingAgent"
+
+  -- Dates
+  time <- getTime
+  let today = date (year time) (month time) (day time)
+  let issueDate = today
+  let maturityDate = addYears 2 issueDate
+  let issuanceCloseDate = addDays 30 issueDate
+
+  -- Calculate coupon dates
+  let frequency = SemiAnnually
+  let couponDates = calculateCouponDates issueDate maturityDate frequency
+
+  -- Bond instrument definition
+  let bondInstrument = BondInstrument with
+        isin = "US1234567890"
+        issuer = issuer
+        description = "2-Year Corporate Bond"
+        currency = "USD"
+        faceValue = 1000.0
+        couponRate = 0.05 -- 5%
+        couponFrequency = frequency
+        issueDate = issueDate
+        maturityDate = maturityDate
+        couponDates = couponDates
+        payingAgent = payingAgent
+        observers = []
+
+  -- Create the bond issuance
+  issuanceCid <- submit issuer do
+    create BondIssuance with
+      instrument = bondInstrument
+      maxIssuanceAmount = 1_000_000.0
+      currentIssuanceAmount = 0.0
+      issuanceCloseDate = issuanceCloseDate
+      subscribers = []
+
+  -- Investor 1 subscribes
+  holding1Cid <- submit investor1 do
+    exercise issuanceCid Subscribe with
+      investor = investor1
+      custodian = custodian
+      quantity = 50.0 -- 50 units * 1000 face value = $50,000
+
+  -- Investor 1 splits their holding
+  holding1 <- fetch holding1Cid
+  assertMsg "Holding quantity mismatch" (holding1.quantity == 50.0)
+
+  splitCids <- submit investor1 do
+    exercise holding1Cid Split with amounts = [20.0, 30.0]
+
+  splitHolding1 <- fetch splitCids.head
+  splitHolding2 <- fetch splitCids.tail.head
+  assertMsg "Split holding 1 quantity mismatch" (splitHolding1.quantity == 20.0)
+  assertMsg "Split holding 2 quantity mismatch" (splitHolding2.quantity == 30.0)
+
+  -- Investor 1 transfers the 30-unit holding to Investor 2
+  transferProposalCid <- submit investor1 do
+    exercise splitHolding2 Propose_Transfer with newOwner = investor2
+
+  holding2Cid <- submit investor2 do
+    exercise transferProposalCid Accept_Transfer
+
+  holding2 <- fetch holding2Cid
+  assertMsg "Transferred holding owner mismatch" (holding2.owner == investor2)
+  assertMsg "Transferred holding quantity mismatch" (holding2.quantity == 30.0)
+
+  pure ()
