@@ -1,0 +1,120 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module BondIssuance where
+
+import DA.Date as D
+import DA.Map (Map)
+import DA.Map as Map
+import DA.Time (getTime)
+import DA.Assert (assertMsg)
+import DA.Conversion (convert)
+
+import Bond (BondDetails, BondHolding)
+
+-- | Represents the active subscription period for a new bond issuance.
+-- The Issuer creates this contract to allow Investors to subscribe to a bond
+-- before it is officially issued and distributed. This contract manages the
+-- subscription window, tracks subscriptions, and ensures the total issuance
+-- amount is not exceeded.
+template BondIssuance
+  with
+    issuer : Party
+      -- ^ The entity issuing the bond.
+    centralBank : Party
+      -- ^ The central bank or settlement authority, an observer of the process.
+    payingAgent : Party
+      -- ^ The agent responsible for future payments, an observer of the process.
+    bondDetailsCid : ContractId BondDetails
+      -- ^ Contract ID for the static details of the bond being issued.
+    issuancePrice : Decimal
+      -- ^ The price per single bond unit during this issuance.
+    subscriptionStartDate : Date
+      -- ^ The first day investors can subscribe.
+    subscriptionEndDate : Date
+      -- ^ The last day investors can subscribe.
+    maxIssuanceQuantity : Int
+      -- ^ The maximum number of bond units to be issued.
+    currentIssuanceQuantity : Int
+      -- ^ The number of bond units currently subscribed.
+    subscriptions : Map Party Int
+      -- ^ A map of investors to their subscribed quantity of bond units.
+
+  where
+    signatory issuer
+    observer centralBank, payingAgent
+
+    key (issuer, bondDetailsCid) : (Party, ContractId BondDetails)
+    maintainer key._1
+
+    ensure
+      issuancePrice > 0.0 &&
+      maxIssuanceQuantity > 0 &&
+      currentIssuanceQuantity >= 0 &&
+      currentIssuanceQuantity <= maxIssuanceQuantity &&
+      subscriptionStartDate <= subscriptionEndDate
+
+    -- | Allows an investor to subscribe to the bond issuance by specifying the
+    -- quantity of bond units they wish to purchase. This choice is controller
+    -- by the investor themselves.
+    choice Subscribe : ContractId BondIssuance
+      with
+        investor : Party
+          -- ^ The party subscribing to the bond.
+        quantity : Int
+          -- ^ The number of bond units the investor wants to subscribe for.
+      controller investor
+      do
+        now <- getTime
+        let today = D.date (year now) (month now) (day now)
+
+        -- Validate that the subscription is happening within the allowed window.
+        assertMsg "Subscription period has not started yet." (today >= subscriptionStartDate)
+        assertMsg "Subscription period has ended." (today <= subscriptionEndDate)
+
+        -- Validate subscription quantity.
+        assertMsg "Subscription quantity must be positive." (quantity > 0)
+        let newTotalQuantity = currentIssuanceQuantity + quantity
+        assertMsg "Subscription exceeds the maximum issuance quantity." (newTotalQuantity <= maxIssuanceQuantity)
+
+        -- Update the map of subscriptions. If the investor has already subscribed,
+        -- this adds to their existing amount.
+        let newSubscriptions = Map.insert investor (Map.findWithDefault 0 investor subscriptions + quantity) subscriptions
+
+        -- Recreate the issuance contract with updated subscription data.
+        create this with
+          currentIssuanceQuantity = newTotalQuantity
+          subscriptions = newSubscriptions
+
+    -- | Executed by the issuer to finalize the issuance after the subscription period ends.
+    -- This choice archives the issuance contract and creates the individual BondHolding
+    -- contracts for each subscriber, representing their ownership of the new bonds.
+    choice CloseIssuance : ()
+      controller issuer
+      do
+        now <- getTime
+        let today = D.date (year now) (month now) (day now)
+
+        -- Ensure issuance can only be closed after the subscription period is over.
+        assertMsg "Cannot close issuance before the subscription period ends." (today > subscriptionEndDate)
+
+        -- Fetch bond details needed to create the holding contracts.
+        details <- fetch bondDetailsCid
+
+        -- Create a BondHolding contract for each subscription. This is where the
+        -- digital asset (the bond holding) is actually created and distributed to investors.
+        forA_ (Map.toList subscriptions) \(investor, quantity) -> do
+          let
+            totalFaceValue = details.faceValue * (convert @Decimal quantity)
+            totalPurchasePrice = issuancePrice * (convert @Decimal quantity)
+
+          create BondHolding with
+            issuer
+            investor
+            centralBank
+            payingAgent
+            bondDetailsCid
+            quantity
+            totalFaceValue
+            purchasePrice = totalPurchasePrice
+            purchaseDate = today
