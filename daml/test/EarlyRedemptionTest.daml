@@ -1,0 +1,193 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module EarlyRedemptionTest where
+
+import Daml.Script
+import DA.Date as D
+import DA.Time as T
+import DA.Assert
+import DA.Optional (isSome, fromSome)
+import qualified DA.Set as Set
+
+import EarlyRedemption (EarlyRedemptionProposal(..))
+import Bond (Bond(..), BondData(..))
+import Fungible (Asset(..))
+
+-- | Main entry point for the test script.
+earlyRedemptionTests = script do
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
+  bondholder <- allocatePartyWithHint "Bondholder" (PartyIdHint "bondholder")
+  stranger <- allocatePartyWithHint "Stranger" (PartyIdHint "stranger")
+
+  -- Use a fixed date for deterministic tests
+  let today = D.date 2024 Jul 19
+  setTime (T.time today 0 0 0)
+
+  let
+    -- Realistic bond data with a call schedule
+    bondData = BondData with
+      isin = "US084664AS34" -- Example callable bond ISIN (Berkshire Hathaway)
+      currency = "USD"
+      faceValue = 1_000_000.0
+      maturityDate = D.date 2030 Jan 15
+      couponRate = 0.05
+      couponFrequency = "Semi-Annually"
+      paymentDates = [] -- Not relevant for this test
+      dayCountConvention = "30/360"
+      callSchedule = Some [(D.date 2025 Jan 15, 101.0), (D.date 2026 Jan 15, 100.5)]
+
+    callDate = D.date 2025 Jan 15
+    callPrice = 101.0
+    redemptionAmount = bondData.faceValue * callPrice / 100.0 -- 1,010,000.0
+
+  -- Test helper to set up a clean state for each test: a bond held by the
+  -- bondholder and enough cash held by the issuer for redemption.
+  let setup = script do
+    bondCid <- submit issuer do
+      createCmd Bond with
+        issuer
+        owner = bondholder
+        data = bondData
+        observers = Set.empty
+
+    cashCid <- submit issuer do
+      createCmd Fungible.Asset with
+        issuer
+        owner = issuer
+        quantity = redemptionAmount
+        description = bondData.currency
+        observers = Set.empty
+
+    return (bondCid, cashCid)
+
+  test "Happy Path: Successful early redemption proposal, acceptance, and settlement" do
+    (bondCid, cashCid) <- setup
+
+    -- Issuer proposes early redemption, referencing the bond and payment asset.
+    proposalCid <- submit issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with
+        callDate
+        callPrice
+        paymentAssetCid = cashCid
+
+    -- Verify the proposal contract exists with correct terms.
+    proposal <- queryContractId issuer proposalCid
+    proposal.issuer === issuer
+    proposal.bondholder === bondholder
+    proposal.callDate === callDate
+    proposal.callPrice === callPrice
+    proposal.paymentAssetCid === cashCid
+
+    -- The bondholder accepts the proposal.
+    submit bondholder do exerciseCmd proposalCid Accept
+
+    -- Verify the bond is redeemed (archived) from the bondholder's view.
+    queryContractId bondholder bondCid >>= \c -> c === None
+
+    -- Verify the proposal is consumed.
+    queryContractId issuer proposalCid >>= \c -> c === None
+
+    -- Verify the payment asset was successfully transferred to the bondholder.
+    -- The specific contract ID of the new asset is not known beforehand, so we query by template.
+    bondholderCash <- queryContracts (Party bondholder)
+    case filter (\c -> c.payload.description == bondData.currency) bondholderCash of
+      [newCashContract] -> do
+        newCashContract.payload.owner === bondholder
+        newCashContract.payload.quantity === redemptionAmount
+      other -> assertFailure $ "Expected exactly one cash contract for bondholder, but found: " <> show other
+
+  test "Rejection: Bondholder rejects the early redemption proposal" do
+    (bondCid, cashCid) <- setup
+
+    proposalCid <- submit issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = cashCid
+
+    -- The bondholder explicitly rejects the proposal.
+    submit bondholder do exerciseCmd proposalCid Reject
+
+    -- Verify proposal is consumed.
+    queryContractId issuer proposalCid >>= \c -> c === None
+
+    -- Verify the original bond contract still exists and is active.
+    queryContractId bondholder bondCid >>= \c -> isSome c === True
+
+    -- Verify the cash asset has not moved and is still owned by the issuer.
+    cash <- fetch cashCid
+    cash.owner === issuer
+
+  test "Withdrawal: Issuer withdraws the early redemption proposal" do
+    (bondCid, cashCid) <- setup
+
+    proposalCid <- submit issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = cashCid
+
+    -- The issuer withdraws the proposal before it is actioned.
+    submit issuer do exerciseCmd proposalCid Withdraw
+
+    -- Verify proposal is consumed.
+    queryContractId issuer proposalCid >>= \c -> c === None
+
+    -- Verify the original bond contract still exists and is active.
+    queryContractId bondholder bondCid >>= \c -> isSome c === True
+
+  test "Authorization: Proposal choices fail for unauthorized parties" do
+    (bondCid, cashCid) <- setup
+
+    proposalCid <- submit issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = cashCid
+
+    -- A third-party stranger cannot exercise any choices.
+    submitMustFail stranger do exerciseCmd proposalCid Accept
+    submitMustFail stranger do exerciseCmd proposalCid Reject
+    submitMustFail stranger do exerciseCmd proposalCid Withdraw
+
+    -- The issuer can only withdraw their own proposal.
+    submitMustFail issuer do exerciseCmd proposalCid Accept
+    submitMustFail issuer do exerciseCmd proposalCid Reject
+
+    -- The bondholder can only accept or reject, not withdraw.
+    submitMustFail bondholder do exerciseCmd proposalCid Withdraw
+
+  test "Validation: Acceptance fails if payment amount is incorrect" do
+    (bondCid, _cashCid) <- setup
+
+    -- Create a cash asset with an amount that is insufficient for the redemption.
+    incorrectCashCid <- submit issuer do
+      createCmd Fungible.Asset with
+        issuer
+        owner = issuer
+        quantity = redemptionAmount - 1.0 -- Incorrect amount
+        description = bondData.currency
+        observers = Set.empty
+
+    proposalCid <- submit issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = incorrectCashCid
+
+    -- The `Accept` choice should contain an assertion that verifies the payment amount
+    -- against the bond face value and call price.
+    submitMustFail bondholder do exerciseCmd proposalCid Accept
+
+  test "Validation: Proposal fails if call date is not in the schedule" do
+    (bondCid, cashCid) <- setup
+
+    let invalidCallDate = D.date 2025 Feb 01 -- A date not specified in the call schedule
+    -- The `ProposeEarlyRedemption` choice on the Bond should validate that the
+    -- proposed date is part of the bond's callable terms.
+    submitMustFail issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with
+        callDate = invalidCallDate
+        callPrice
+        paymentAssetCid = cashCid
+
+  test "Validation: Proposal fails if call price is incorrect for the given date" do
+    (bondCid, cashCid) <- setup
+
+    let wrongCallPrice = 101.1 -- Incorrect price for the 2025-01-15 call date
+    -- The `ProposeEarlyRedemption` choice should also validate that the provided price
+    -- matches the schedule for the given date.
+    submitMustFail issuer do
+      exerciseCmd bondCid ProposeEarlyRedemption with
+        callDate
+        callPrice = wrongCallPrice
+        paymentAssetCid = cashCid
