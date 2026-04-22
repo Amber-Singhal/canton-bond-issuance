@@ -1,0 +1,191 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Bond.V1.EarlyRedemption where
+
+import Daml.Script
+
+import DA.Date as Date
+import DA.Time (time)
+import DA.Validation (Validation, succeed, fail, validation, Validation(..))
+import DA.Either (isLeft, validationToEither)
+
+import Bond.V1.Instrument (Bond(..))
+import Bond.V1.Types (BondData, BondTerms(..), CallScheduleItem(..), PaymentFrequency(..))
+
+-- | A data type representing the details of a proposed early redemption.
+data EarlyRedemptionDetails = EarlyRedemptionDetails
+  with
+    redemptionDate : Date
+      -- ^ The date on which the early redemption (call) will occur.
+    callPrice : Decimal
+      -- ^ The price at which the bond will be redeemed, typically par plus a premium.
+    paymentDueDate : Date
+      -- ^ The date by which the payment for the redemption must be made.
+  deriving (Eq, Show, Ord)
+
+-- | Proposal from an Issuer to an Investor to redeem a bond early.
+-- This represents a "call" option being exercised by the issuer. The investor must
+-- acknowledge this proposal, which transitions the bond to a settlement-pending state.
+template EarlyRedemptionProposal
+  with
+    issuer : Party
+      -- ^ The issuer of the bond, proposing the redemption.
+    investor : Party
+      -- ^ The current holder of the bond.
+    payingAgent : Party
+      -- ^ The agent responsible for facilitating the payment.
+    bondCid : ContractId Bond
+      -- ^ The contract ID of the bond to be redeemed.
+    bondData : BondData
+      -- ^ Key data from the bond contract, to avoid fetches and for display purposes.
+    redemptionDetails : EarlyRedemptionDetails
+      -- ^ The specific terms of this early redemption proposal.
+  where
+    signatory issuer
+    observer investor, payingAgent
+
+    key (issuer, bondData.isin, investor) : (Party, Text, Party)
+    maintainer key._1
+
+    choice EarlyRedemptionProposal_Acknowledge : ContractId BondRedemptionPending
+      -- ^ The investor acknowledges the issuer's early redemption proposal.
+      -- This transitions the bond into a state pending settlement.
+      -- In a typical bond covenant, a call is a right of the issuer, not a request,
+      -- so the investor's action is an acknowledgement rather than an acceptance.
+      controller investor
+      do
+        exercise bondCid Bond_InitiateEarlyRedemption with
+          redemptionDetails = redemptionDetails
+
+    choice EarlyRedemptionProposal_Withdraw : ()
+      -- ^ The issuer withdraws the proposal before it is acknowledged.
+      controller issuer
+      do
+        pure ()
+
+-- | Contract representing a bond that has been called for early redemption
+-- and is now awaiting settlement.
+template BondRedemptionPending
+  with
+    issuer : Party
+      -- ^ The issuer who owes the redemption payment.
+    investor : Party
+      -- ^ The investor to whom the redemption payment is owed.
+    payingAgent : Party
+      -- ^ The agent responsible for settling the payment.
+    bondData : BondData
+      -- ^ The data of the original bond instrument.
+    redemptionDetails : EarlyRedemptionDetails
+      -- ^ The details of the redemption payment.
+  where
+    signatory issuer, investor
+    observer payingAgent
+
+    key (issuer, bondData.isin, investor) : (Party, Text, Party)
+    maintainer key._1
+
+    choice BondRedemptionPending_Settle : ()
+      -- ^ The paying agent confirms settlement of the early redemption.
+      -- This choice archives the pending contract, completing the lifecycle of the bond.
+      -- A real-world implementation would model the DvP leg by taking a payment
+      -- contract ID as an argument and verifying its details before archiving it.
+      controller payingAgent
+      do
+        -- In a production system, this choice would verify and consume a payment contract.
+        -- For example:
+        -- payment <- fetch paymentCid
+        -- assert (payment.amount == redemptionDetails.callPrice)
+        -- assert (payment.receiver == investor)
+        -- archive paymentCid
+        pure ()
+
+-- | Calculates the call price for a given redemption date based on the bond's call schedule.
+-- Returns a Validation type to handle errors gracefully, such as an invalid call date.
+calculateCallPrice : BondTerms -> Date -> Validation Text Decimal
+calculateCallPrice terms redemptionDate =
+  case terms.callSchedule of
+    None -> Failure "Bond is not callable."
+    Some schedule ->
+      -- Find the applicable call period. We look for the latest start date
+      -- that is on or before the redemption date.
+      let
+        applicablePeriods = filter (\p -> p.callStartDate <= redemptionDate) schedule
+      in
+        if null applicablePeriods then
+          Failure ("Redemption date " <> show redemptionDate <> " is before the first call date.")
+        else
+          -- The bond covenant usually specifies using the latest applicable schedule.
+          -- We find the period with the max start date from the applicable ones.
+          let
+            findLatest : [CallScheduleItem] -> CallScheduleItem
+            findLatest (x:xs) = foldl (\acc i -> if i.callStartDate > acc.callStartDate then i else acc) x xs
+            findLatest [] = error "Impossible: applicablePeriods is guaranteed to be non-empty"
+
+            latestPeriod = findLatest applicablePeriods
+          in
+            -- A more robust model could have explicit end dates for each call period.
+            -- Here we assume the period lasts until the next one begins or maturity.
+            Success (terms.faceValue * (1.0 + latestPeriod.callPremium))
+
+
+-- | Daml Script for testing the early redemption logic, specifically the price calculation.
+testEarlyRedemption : Script ()
+testEarlyRedemption = script do
+  let
+    issueDate = Date.date 2024 Jan 15
+    maturityDate = Date.date 2029 Jan 15
+
+    -- Define a call schedule where the premium decreases over time.
+    callSchedule =
+      [ CallScheduleItem with callStartDate = Date.date 2025 Jan 15, callPremium = 0.03 -- Price: 103
+      , CallScheduleItem with callStartDate = Date.date 2026 Jan 15, callPremium = 0.02 -- Price: 102
+      , CallScheduleItem with callStartDate = Date.date 2027 Jan 15, callPremium = 0.01 -- Price: 101
+      , CallScheduleItem with callStartDate = Date.date 2028 Jan 15, callPremium = 0.00 -- Price: 100 (par)
+      ]
+
+    terms = BondTerms with
+      isin = "TEST-BOND-CALLABLE"
+      description = "Test Corporate Bond 5Y"
+      currency = "USD"
+      faceValue = 1000.0
+      couponRate = 0.05
+      issueDate = issueDate
+      maturityDate = maturityDate
+      paymentFrequency = Annually
+      dayCountConvention = Act365
+      callSchedule = Some callSchedule
+
+  -- Test Case 1: Valid call date within a period
+  let redemptionDate1 = Date.date 2026 Mar 15
+  let validationResult1 = calculateCallPrice terms redemptionDate1
+  debug $ "Test 1 (should be 1020.0): " <> show validationResult1
+  assert (validationResult1 == Success 1020.0)
+
+  -- Test Case 2: Call date before the first call period is allowed
+  let redemptionDate2 = Date.date 2024 Dec 31
+  let validationResult2 = calculateCallPrice terms redemptionDate2
+  debug $ "Test 2 (should fail): " <> show validationResult2
+  assert (isLeft $ validationToEither validationResult2)
+
+  -- Test Case 3: Bond is not callable
+  let nonCallableTerms = terms with callSchedule = None
+  let validationResult3 = calculateCallPrice nonCallableTerms redemptionDate1
+  debug $ "Test 3 (should fail for non-callable bond): " <> show validationResult3
+  assert (isLeft $ validationToEither validationResult3)
+
+  -- Test Case 4: Call on the exact start date of a period
+  let redemptionDate4 = Date.date 2027 Jan 15
+  let validationResult4 = calculateCallPrice terms redemptionDate4
+  debug $ "Test 4 (should be 1010.0): " <> show validationResult4
+  assert (validationResult4 == Success 1010.0)
+
+  -- Test Case 5: Call in the final period (par call)
+  let redemptionDate5 = Date.date 2028 Nov 30
+  let validationResult5 = calculateCallPrice terms redemptionDate5
+  debug $ "Test 5 (should be 1000.0): " <> show validationResult5
+  assert (validationResult5 == Success 1000.0)
+
+  pure ()
