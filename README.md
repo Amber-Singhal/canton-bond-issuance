@@ -2,172 +2,155 @@
 
 [![CI](https://github.com/digital-asset/canton-bond-issuance/actions/workflows/ci.yml/badge.svg)](https://github.com/digital-asset/canton-bond-issuance/actions/workflows/ci.yml)
 
-This project provides a reference implementation for the full lifecycle of a digital bond on the Canton Network, built using Daml smart contracts. It covers issuance, subscription by investors, periodic coupon payments, and final redemption at maturity.
+This project provides a complete, production-quality reference implementation for the lifecycle of a digital bond, built on the [Canton Network](https://www.canton.network/) using the [Daml](https://daml.com/) smart contract language.
 
-The platform is designed to model the interactions between key financial market participants in a privacy-preserving, atomic, and auditable manner.
+It covers the entire workflow from issuance and subscription to periodic coupon payments and final redemption, demonstrating how distributed ledger technology can bring efficiency, transparency, and automation to capital markets.
 
 ## Table of Contents
 
-- [Core Concepts](#core-concepts)
-- [Technology Stack](#technology-stack)
+- [Features](#features)
+- [Bond Lifecycle Workflow](#bond-lifecycle-workflow)
+- [Daml Model Architecture](#daml-model-architecture)
 - [Prerequisites](#prerequisites)
 - [Getting Started](#getting-started)
-- [User Onboarding Guide](#user-onboarding-guide)
-  - [For Issuers](#for-issuers)
-  - [For Investors](#for-investors)
-  - [For the Paying Agent](#for-the-paying-agent)
 - [Project Structure](#project-structure)
-- [Daml Model Overview](#daml-model-overview)
-- [Running Tests](#running-tests)
+- [Automated Processes](#automated-processes)
 
-## Core Concepts
+## Features
 
-The application models a simplified bond market workflow with the following roles:
+- **Bond Instrument Definition**: Create and configure bond instruments with standard financial terms (e.g., ISIN, face value, coupon rate, maturity date, payment frequency).
+- **Role-Based Permissions**: Clearly defined roles for all network participants: `Issuer`, `Investor`, `Central Securities Depository (CSD)`, and `Paying Agent`.
+- **Subscription and Allocation**: A robust workflow for investors to subscribe to a new issuance during a defined window, followed by the issuer allocating bonds.
+- **Automated Coupon Payments**: Logic for calculating and distributing periodic coupon payments to all current bondholders.
+- **Atomic Settlement**: Utilizes Canton's atomic transaction model for Delivery-vs-Payment (DvP) during allocation and interest/principal payments.
+- **Maturity and Redemption**: Handles the final principal repayment to bondholders at the bond's maturity date.
+- **Optional Early Redemption**: A workflow for the issuer to propose an early redemption, which can be accepted by bondholders.
+- **Privacy by Design**: Leverages Canton's privacy model, ensuring that only stakeholders to a specific contract can view its details.
 
-*   **CSD (Central Securities Depository)**: The central operator of the platform, responsible for onboarding other participants.
-*   **Issuer**: An entity (e.g., a corporation or government) that creates and issues bonds to raise capital.
-*   **Investor**: An entity that subscribes to and holds bonds, receiving coupon payments and principal at maturity.
-*   **Paying Agent**: An entity, typically a bank appointed by the Issuer, responsible for disbursing coupon payments and the final redemption amount to bondholders.
+## Bond Lifecycle Workflow
 
-The bond lifecycle proceeds through these stages:
+The platform models the following end-to-end process:
 
-1.  **Issuance**: The Issuer defines the bond's terms (ISIN, maturity date, coupon rate, etc.) and offers it on the platform.
-2.  **Subscription**: Investors view the offering and submit `SubscriptionRequest`s to purchase a certain quantity of the bond.
-3.  **Allocation**: The Issuer accepts subscription requests, and `BondHolding` contracts are atomically created for each investor.
-4.  **Coupon Payments**: On predefined payment dates, the Paying Agent disburses coupon payments to all current bondholders.
-5.  **Redemption**: At the bond's maturity date, the Paying Agent disburses the final principal amount to bondholders, and the bond contracts are archived.
+1.  **Setup & Onboarding**: The CSD onboards the Issuer, Paying Agent, and Investors by issuing them digitally signed `Role` contracts. These contracts govern their permissions and relationships on the platform.
 
-## Technology Stack
+2.  **Issuance Definition**: The Issuer, acting through the CSD, creates a `BondIssuance` contract. This contract contains all the immutable terms of the bond and serves as the single source of truth for the instrument.
 
-*   **Smart Contracts**: [Daml](https://daml.com)
-*   **Ledger**: [Canton Network](https://www.canton.io)
-*   **Frontend**: React, TypeScript, [@c7/react](https://docs.daml.com/c7/c7-react/reference/index.html)
-*   **Build Tool**: DPM (Digital Asset Package Manager)
+3.  **Subscription Window**: The `BondIssuance` is published, opening a subscription window. Verified `Investors` can submit `SubscriptionRequest` contracts, signaling their intent to purchase a certain quantity of the bond.
+
+4.  **Allocation & Settlement**: Once the subscription window closes, the Issuer reviews the requests and creates `Allocation` contracts for successful subscribers. The allocation process is settled atomically; the investor's cash is transferred to the issuer simultaneously with the `BondHolding` contract being issued to the investor (DvP).
+
+5.  **Trading (Secondary Market)**: Post-issuance, `BondHolding` contracts can be transferred between investors, subject to the rules defined in the contracts.
+
+6.  **Coupon Payments**: On each scheduled coupon date, the Paying Agent initiates a process that automatically calculates and distributes payments to the current owners of `BondHolding` contracts.
+
+7.  **Redemption at Maturity**: On the bond's maturity date, the Issuer, via the Paying Agent, repays the principal amount to all final bondholders. The `BondHolding` contracts are then archived, concluding the lifecycle.
+
+## Daml Model Architecture
+
+The core logic is captured in a set of composable Daml templates:
+
+-   `daml/Role.daml`: Defines the permissioning and relationship contracts for each participant (`IssuerRole`, `CSDRole`, `InvestorRole`, `PayingAgentRole`).
+-   `daml/Instrument.daml`: Contains the `BondInstrument` template which defines the static, reusable terms of a bond.
+-   `daml/Issuance.daml`: Defines the `BondIssuance` template, which represents a specific live issuance of a `BondInstrument`. It manages the subscription window and allocation process.
+-   `daml/Subscription.daml`: Includes the `SubscriptionRequest` and `Allocation` templates used during the book-building phase.
+-   `daml/Holding.daml`: The `BondHolding` template represents an investor's ownership of a specific quantity of the bond. This is the asset that is held and potentially traded.
+-   `daml/Payment.daml`: Models the `CouponPaymentLifecycle` and `Redemption` processes, handling the calculation and disbursement of funds.
+-   `daml/EarlyRedemption.daml`: Implements the optional workflow for an issuer-initiated early redemption of the bond.
 
 ## Prerequisites
 
-1.  **DPM**: Ensure you have the Canton/Daml toolchain installed. Follow the instructions at [https://get.digitalasset.com](https://get.digitalasset.com).
-    ```bash
-    curl https://get.digitalasset.com/install/install.sh | sh
-    ```
-2.  **Node.js**: Version 18.x or later.
-3.  **jq**: A command-line JSON processor. ([Download](https://jqlang.github.io/jq/download/))
+-   **Canton (DPM)**: Version 3.4.0 or higher. [Installation Guide](https://docs.canton.io/3.4.0/user-manual/getting-started/download-and-install.html).
+-   **Java**: JDK 11 or higher (required by the Canton sandbox).
+-   **Node.js**: Version 18.x or higher, with `npm`.
 
 ## Getting Started
 
-Follow these steps to run the application locally.
+Follow these steps to build the project and run a local Canton ledger environment.
 
 **1. Clone the Repository**
+
 ```bash
 git clone https://github.com/digital-asset/canton-bond-issuance.git
 cd canton-bond-issuance
 ```
 
 **2. Build the Daml Models**
-This compiles your Daml code into a DAR (Daml Archive) file.
+
+This command compiles the Daml code into a DAR (Daml Archive) file.
+
 ```bash
 dpm build
 ```
-The output will be in `.daml/dist/canton-bond-issuance-0.1.0.dar`.
 
-**3. Start the Local Canton Ledger**
-This command starts a local Canton sandbox environment, including a participant node and the JSON API server.
+The output will be located at `.daml/dist/canton-bond-issuance-0.1.0.dar`.
+
+**3. Start the Canton Sandbox**
+
+This command starts a local Canton ledger instance, exposing a gRPC port (`6865`) and a JSON API (`7575`).
+
 ```bash
 dpm sandbox
 ```
-Leave this process running in a terminal window. The JSON API will be available at `http://localhost:7575`.
 
-**4. Generate TypeScript Code**
-From a new terminal, generate TypeScript bindings from your DAR file for the frontend.
+The sandbox will remain running. Open a new terminal for the next steps.
+
+**4. Run Tests & Initialize Ledger**
+
+The Daml Script tests also serve to initialize the ledger with parties and example contracts, setting up a realistic scenario for the frontend UI.
+
 ```bash
-dpm codegen-js
+dpm test
 ```
 
-**5. Install Frontend Dependencies**
+This script will:
+- Allocate parties for the CSD, Issuer, Paying Agent, and several Investors.
+- Create role contracts to establish relationships.
+- Create a sample `BondIssuance` contract.
+- Simulate investor subscriptions.
+
+**5. Run the Frontend Application**
+
+Navigate to the frontend directory, install dependencies, and start the local development server.
+
 ```bash
 cd frontend
 npm install
-```
-
-**6. Run the Initialization Script**
-This script allocates the necessary parties (CSD, Issuer, Investors, etc.) on the ledger and creates the initial CSD role contract.
-```bash
-npm run init-script
-```
-The script will create a `.env` file containing the party identifiers for the UI.
-
-**7. Start the Frontend Application**
-```bash
 npm start
 ```
-Your browser should open to `http://localhost:3000`, where you can interact with the application.
 
-## User Onboarding Guide
-
-The UI includes a login dropdown in the top right corner. Select a role to view the ledger from that party's perspective.
-
-### For Issuers
-
-1.  **Log in**: Select `ACME_Corporation::...` (the Issuer) from the dropdown.
-2.  **Create New Issuance**: Click the "Create New Bond Issuance" button.
-3.  **Fill Details**: Complete the form with the bond's specifications, as outlined in `docs/BOND_SPEC.md`. This includes ISIN, face value, coupon rate, payment dates, etc.
-4.  **Submit**: Submitting the form creates a `BondIssuance` contract proposal, which the CSD must approve.
-5.  **View Subscriptions**: Once approved and live, you can view incoming subscription requests from investors on your dashboard and choose to accept them.
-
-### For Investors
-
-1.  **Log in**: Select `Investor_Alice::...` or `Investor_Bob::...` from the dropdown.
-2.  **Browse Issuances**: The main dashboard shows all active bond issuances you are invited to.
-3.  **Subscribe**: Click "Subscribe" on a bond you are interested in.
-4.  **Enter Amount**: Specify the quantity of bonds you wish to purchase and submit. This creates a `SubscriptionRequest` contract.
-5.  **View Holdings**: Once the Issuer accepts your request, a `BondHolding` contract will appear on your dashboard. You will see scheduled coupon payments and receive them automatically on the due dates.
-
-### For the Paying Agent
-
-1.  **Log in**: Select `Global_Payments_Inc::...` (the Paying Agent) from the dropdown.
-2.  **View Obligations**: Your dashboard lists all bonds for which you are the designated paying agent.
-3.  **Process Payments**: The dashboard shows upcoming coupon and redemption payment obligations. In a production system, this would be automated. In this reference app, you can manually trigger the `ProcessCouponPayment` or `ProcessRedemption` choices to simulate disbursement. This demonstrates the atomic settlement of payments to all bondholders.
+The application will be available at `http://localhost:3000`.
 
 ## Project Structure
 
 ```
 .
-├── daml/                      # Daml smart contract source code
-│   └── Bond/
-│       ├── Holding.daml       # BondHolding and related contracts
-│       ├── Issuance.daml      # BondIssuance contract for offerings
-│       └── Roles.daml         # Participant role contracts
-├── frontend/                  # React/TypeScript frontend application
+├── daml/                        # All Daml smart contract code
+│   ├── Bond.daml
+│   ├── EarlyRedemption.daml
+│   ├── Holding.daml
+│   ├── Instrument.daml
+│   ├── Issuance.daml
+│   ├── Payment.daml
+│   ├── Role.daml
+│   ├── Subscription.daml
+│   └── test/                    # Daml Script tests for automation and setup
+│       ├── Main.daml
+│       └── EarlyRedemptionTest.daml
+├── frontend/                    # React-based user interface
+│   ├── public/
 │   ├── src/
 │   ├── package.json
 │   └── ...
-├── .github/                   # GitHub Actions CI configuration
-│   └── workflows/
-│       └── ci.yml
-├── docs/                      # Project documentation
-│   └── BOND_SPEC.md
-├── daml.yaml                  # Daml project configuration
-├── README.md                  # This file
-└── ...
+├── .gitignore
+├── daml.yaml                    # Daml package configuration
+└── README.md
 ```
 
-## Daml Model Overview
+## Automated Processes
 
-The core logic is captured in a set of Daml templates:
+Workflows that run on a schedule, such as coupon payments, are ideal candidates for automation. This can be achieved using:
 
-*   **`Roles.Daml.CsdRole`**: A contract establishing the CSD's authority on the platform.
-*   **`Roles.Daml.IssuerRole`**: Grants an Issuer the right to propose new bond issuances.
-*   **`Issuance.Daml.BondIssuanceProposal`**: An Issuer's request to create a new bond. Must be approved by the CSD.
-*   **`Issuance.Daml.BondIssuance`**: The active bond offering contract, visible to invited investors.
-*   **`Issuance.Daml.SubscriptionRequest`**: An Investor's request to purchase a specific quantity of a bond.
-*   **`Holding.Daml.BondHolding`**: Represents an investor's ownership of a bond. This is the primary instrument that receives payments.
-*   **`Holding.Daml.CouponPayment`**: A contract representing a single, scheduled coupon payment obligation from the Paying Agent to a `BondHolding` owner.
-*   **`Holding.Daml.Redemption`**: A contract representing the final principal repayment obligation.
+-   **Canton Triggers**: On-ledger, Daml-native automation rules that react to ledger events or time.
+-   **External Automation Service**: An off-ledger service that connects to the ledger's JSON API or gRPC interface to submit transactions based on its own scheduler.
 
-## Running Tests
-
-The project includes Daml Script tests to verify the contract logic. To run them:
-
-```bash
-dpm test
-```
+The Daml models in this project are designed to be compatible with both approaches. The `Payment.daml` module, for instance, contains choices that can be invoked by an automated agent to initiate the coupon payment cascade.
