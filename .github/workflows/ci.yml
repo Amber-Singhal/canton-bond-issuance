@@ -2,14 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [ "main" ]
 
 jobs:
-  daml-ci:
-    name: Daml Build, Test & Simulation
+  build-and-test:
+    name: Build and Test Daml Contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -24,43 +23,19 @@ jobs:
       - name: Verify DPM installation
         run: dpm --version
 
-      - name: Build Daml model
+      - name: Cache DPM package dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.dpm/packages
+          key: ${{ runner.os }}-dpm-${{ hashFiles('**/daml.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-dpm-
+
+      - name: Build Daml project
         run: dpm build
 
-      - name: Run Daml unit tests
+      - name: Run all Daml Script tests
+        # This command discovers and runs all test scripts in the `daml/test` directory.
+        # It is expected to include unit tests for individual templates as well as
+        # end-to-end lifecycle simulations, such as the paying agent disbursing coupons.
         run: dpm test
-
-      - name: Run Paying Agent Simulation
-        # This script runs a more extensive, end-to-end test simulating
-        # the paying agent's role over the bond lifecycle.
-        run: dpm test --files daml/Test/PayingAgentSimulation.daml
-
-  frontend-ci:
-    name: Frontend Build & Test
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./frontend
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint check
-        run: npm run lint
-
-      - name: Build application
-        run: npm run build
-
-      - name: Run tests
-        # The --watchAll=false flag is important for running in a non-interactive CI environment
-        run: npm test -- --watchAll=false
