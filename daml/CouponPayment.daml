@@ -3,190 +3,195 @@
 
 module CouponPayment where
 
-import DA.Date (Date)
-import DA.Assert (assertMsg)
+import DA.Date (Date, Month(..), fromGregorian, year, month, day, diffDays)
+import Daml.Script
 
-import Daml.Finance.Interface.Types.Common.Types (Account, Id)
-import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (I, exerciseInterfaceByKey, Split(..), Transfer(..))
+-- | Defines standard day count conventions for calculating interest accrual.
+data DayCountConvention =
+    -- | Actual/Actual ISDA: Uses the actual number of days in a period divided
+    -- by the actual number of days in the year. Accurately handles leap years
+    -- and periods crossing year boundaries. This is the most precise method.
+    ActActISDA
+    -- | 30/360: Assumes every month has 30 days and every year has 360 days.
+    -- Common in the US corporate bond market. Simplifies calculations but is less precise.
+  | Thirty360
+  deriving (Eq, Show, Ord)
 
-import Bond (I, View, Holding)
-
--- | An instruction from the Issuer to the PayingAgent to prepare for a coupon payment.
--- The PayingAgent will acknowledge this instruction, creating a `CouponPayment` contract
--- that will manage the funding and disbursement process.
-template CouponPaymentInstruction
-  with
-    issuer: Party
-      -- ^ The party issuing the bond.
-    payingAgent: Party
-      -- ^ The agent responsible for disbursing coupon payments.
-    bondCid: ContractId I
-      -- ^ The contract ID of the bond for which the coupon is being paid.
-    bondView: View
-      -- ^ The view of the bond instrument at the time of instruction.
-    paymentDate: Date
-      -- ^ The scheduled date for this coupon payment.
-    recordDate: Date
-      -- ^ The date on which bond holdings are checked to determine who receives payment.
-    couponAmountPerUnit: Decimal
-      -- ^ The calculated coupon amount for each unit of the bond's notional quantity.
-    currency: Id
-      -- ^ The identifier for the payment currency.
-  where
-    signatory issuer
-    observer payingAgent
-
-    key (bondView.id, paymentDate) : (Id, Date)
-    maintainer key._1.signatories
-
-    ensure
-      bondView.issuer == issuer &&
-      bondView.payingAgent == some payingAgent &&
-      recordDate < paymentDate
-
-    choice Acknowledge : ContractId CouponPayment
-      -- ^ The PayingAgent acknowledges the instruction and creates the active `CouponPayment` contract.
-      with
-        payingAgentAccount: Account
-          -- ^ The account controlled by the paying agent where the issuer should send the funds.
-      controller payingAgent
-      do
-        let
-          requiredAmount = bondView.quantity * couponAmountPerUnit
-        create CouponPayment with
-          issuer
-          payingAgent
-          bondCid
-          bondView
-          paymentDate
-          recordDate
-          couponAmountPerUnit
-          currency
-          requiredAmount
-          fundedAmount = 0.0
-          payingAgentAccount
-
--- | Manages the lifecycle of a single coupon payment event.
--- It tracks the funding status from the issuer and allows the paying agent to disburse
--- funds to bondholders once fully funded.
+-- | Represents a scheduled coupon payment for a specific bond.
+-- This contract is typically created by a Paying Agent based on a master Bond contract.
+-- It exists for a single coupon period and is intended to be archived after payment.
 template CouponPayment
   with
-    issuer: Party
-      -- ^ The party issuing the bond.
     payingAgent: Party
-      -- ^ The agent responsible for disbursing coupon payments.
-    bondCid: ContractId I
-      -- ^ The contract ID of the bond for which the coupon is being paid.
-    bondView: View
-      -- ^ The view of the bond instrument.
+    investor: Party
+    issuer: Party
+    bondId: Text
+    notionalAmount: Decimal
+    couponRate: Decimal
+    -- ^ Annual coupon rate, e.g., 0.05 for 5%.
+    couponPeriodStartDate: Date
+    -- ^ The start date of the coupon period (inclusive).
+    couponPeriodEndDate: Date
+    -- ^ The end date of the coupon period (exclusive). Interest accrues up to this date.
     paymentDate: Date
-      -- ^ The scheduled date for this coupon payment.
-    recordDate: Date
-      -- ^ The date on which bond holdings are checked to determine who receives payment.
-    couponAmountPerUnit: Decimal
-      -- ^ The coupon amount for each unit of the bond's notional quantity.
-    currency: Id
-      -- ^ The identifier for the payment currency.
-    requiredAmount: Decimal
-      -- ^ The total amount required to pay all bondholders.
-    fundedAmount: Decimal
-      -- ^ The total amount funded by the issuer so far.
-    payingAgentAccount: Account
-      -- ^ The account controlled by the paying agent where the issuer sends funds.
+    -- ^ The date on which the coupon amount is due to be paid to the investor.
+    dayCountConvention: DayCountConvention
+    -- ^ The day count convention used to calculate the coupon amount.
   where
-    signatory payingAgent
+    signatory payingAgent, investor
     observer issuer
 
-    key (bondView.id, paymentDate) : (Id, Date)
-    maintainer key._1.signatories
+    -- | Helper functions for date and interest calculations.
+    let
+      -- | Checks if a given year is a leap year according to the Gregorian calendar.
+      isLeapYear : Int -> Bool
+      isLeapYear y = (y % 4 == 0 && y % 100 /= 0) || (y % 400 == 0)
 
-    -- | A stakeholder can view the payment status to know if it has been funded.
-    nonconsuming choice GetStatus : (Decimal, Decimal)
-      controller issuer, payingAgent
-      do
-        return (fundedAmount, requiredAmount)
-
-    choice Fund : ContractId CouponPayment
-      -- ^ The issuer transfers funds to the paying agent for the coupon payment.
-      -- This can be done in one or more tranches.
-      with
-        amountToFund: Decimal
-        fundingCid: ContractId Fungible.I
-      controller issuer
-      do
-        assertMsg "Funding amount must be positive" $ amountToFund > 0.0
-        let newFundedAmount = fundedAmount + amountToFund
-        assertMsg "Cannot fund more than the required amount" $
-          newFundedAmount <= requiredAmount
-
-        -- Transfer the funds to the paying agent's designated account
-        Fungible.exerciseInterfaceByKey @Fungible.I issuer fundingCid
-          (Fungible.Transfer with destination = payingAgentAccount; newObservers = [])
-
-        create this with fundedAmount = newFundedAmount
-
-    choice Disburse : ()
-      -- ^ The paying agent disburses the coupon payments to all eligible bondholders.
-      -- This choice is consuming and archives the `CouponPayment` contract upon successful disbursement.
-      with
-        holdingsToPay: [ContractId Holding]
-          -- ^ A list of bond holding contracts as of the record date.
-        fundingCid: ContractId Fungible.I
-          -- ^ The fungible contract held by the paying agent containing the total payment amount.
-      controller payingAgent
-      do
-        assertMsg "Coupon payment is not fully funded" $ fundedAmount == requiredAmount
-
-        -- Verify the funding contract has the correct amount and is owned by the paying agent.
-        fundingContract <- fetch fundingCid
-        assertMsg "Incorrect funding contract provided" $
-          fundingContract.instrument == currency &&
-          fundingContract.account == payingAgentAccount &&
-          fundingContract.amount == requiredAmount
-
-        -- This recursive helper pattern processes the payment for each bondholder.
+      -- | Calculates the year fraction using the Actual/Actual ISDA convention.
+      -- This is the most accurate method, correctly handling leap years and periods
+      -- that cross year-end boundaries.
+      -- Assumes the coupon period end date is exclusive.
+      calculateYearFractionActualActual : Date -> Date -> Decimal
+      calculateYearFractionActualActual startDate endDate =
         let
-          disburse' remainingFundingCid [] = return ()
-          disburse' currentFundingCid (holdingCid :: rest) = do
-            holding <- fetch holdingCid
-            let paymentAmount = holding.quantity * self.couponAmountPerUnit
-            if paymentAmount > 0.0 then do
-              -- Split the main fungible contract to get a piece for this specific payment
-              (paymentCid, nextFundingCid) <- exercise currentFundingCid Fungible.Split with splitAmount = paymentAmount
+          startYear = year startDate
+          endYear = year endDate
+        in
+          if startYear == endYear then
+            -- The entire coupon period is within a single year.
+            let
+              daysInPeriod = diffDays endDate startDate
+              daysInYear = if isLeapYear startYear then 366 else 365
+            in
+              intToDecimal daysInPeriod / intToDecimal daysInYear
+          else
+            -- The coupon period crosses a year-end.
+            -- The calculation is split into the portion in the first year and the portion
+            -- in the second year, each with its correct denominator (365 or 366).
+            let
+              -- Date representing the boundary between the two years (e.g., Jan 1 of the second year).
+              yearBoundaryDate = fromGregorian endYear Jan 1
 
-              -- Transfer the payment to the bondholder's account
-              Fungible.exerciseInterfaceByKey @Fungible.I self.payingAgent paymentCid
-                (Fungible.Transfer with destination = holding.ownerAccount; newObservers = [])
+              -- Calculate days and fraction for the first year part.
+              daysInFirstPart = diffDays yearBoundaryDate startDate
+              daysInYear1 = if isLeapYear startYear then 366 else 365
+              fraction1 = intToDecimal daysInFirstPart / intToDecimal daysInYear1
 
-              -- Create a receipt for the transaction
-              create CouponPaymentReceipt with
-                payingAgent = self.payingAgent
-                bondholder = holding.owner
-                bondView = self.bondView
-                paymentDate = self.paymentDate
-                paidAmount = paymentAmount
+              -- Calculate days and fraction for the second year part.
+              daysInSecondPart = diffDays endDate yearBoundaryDate
+              daysInYear2 = if isLeapYear endYear then 366 else 365
+              fraction2 = intToDecimal daysInSecondPart / intToDecimal daysInYear2
+            in
+              fraction1 + fraction2
 
-              -- Recurse with the remaining fungible contract and the rest of the holdings
-              disburse' nextFundingCid rest
-            else
-              -- If payment amount is zero, skip to the next holding
-              disburse' currentFundingCid rest
+      -- | Calculates the year fraction using the 30/360 US convention.
+      -- Assumes 30 days per month and 360 days per year.
+      calculateYearFraction30_360 : Date -> Date -> Decimal
+      calculateYearFraction30_360 startDate endDate =
+        let
+          y1 = year startDate; m1 = fromEnum (month startDate); d1 = day startDate
+          y2 = year endDate;   m2 = fromEnum (month endDate);   d2 = day endDate
 
-        disburse' fundingCid holdingsToPay
+          -- Apply 30/360 US convention rules for day adjustment.
+          d1' = if d1 == 31 then 30 else d1
+          d2' = if d2 == 31 && (d1' == 30 || d1' == 31) then 30 else d2
 
--- | A record of a successfully disbursed coupon payment to a single bondholder.
-template CouponPaymentReceipt
-  with
-    payingAgent: Party
-      -- ^ The party that made the payment.
-    bondholder: Party
-      -- ^ The party that received the payment.
-    bondView: View
-      -- ^ A snapshot of the bond's data at the time of payment.
-    paymentDate: Date
-      -- ^ The date the coupon was paid.
-    paidAmount: Decimal
-      -- ^ The amount paid to the bondholder.
-  where
-    signatory payingAgent
-    observer bondholder
+          totalDays = (y2 - y1) * 360 + (m2 - m1) * 30 + (d2' - d1')
+        in
+          intToDecimal totalDays / 360.0
+
+    key (payingAgent, investor, bondId, paymentDate) : (Party, Party, Text, Date)
+    maintainer key._1
+
+    -- | A controller can call this choice to determine the exact coupon amount
+    -- that should be paid on the payment date. This is useful for pre-calculation
+    -- and verification. It is non-consuming so it can be called multiple times.
+    nonconsuming choice CalculateCouponAmount : Decimal
+      controller payingAgent, investor
+      do
+        let
+          yearFraction = case dayCountConvention of
+            ActActISDA -> calculateYearFractionActualActual couponPeriodStartDate couponPeriodEndDate
+            Thirty360 -> calculateYearFraction30_360 couponPeriodStartDate couponPeriodEndDate
+        let amount = notionalAmount * couponRate * yearFraction
+        -- It's common practice to round financial calculations to a specific precision.
+        -- For this example, we assume Decimal's default precision is sufficient.
+        -- In a real application, rounding rules (e.g., to 2 decimal places for currency)
+        -- would be applied here.
+        return amount
+
+-- | Daml Script for testing the coupon calculation logic.
+testCouponCalculations : Script ()
+testCouponCalculations = script do
+  p <- allocateParty "Party"
+
+  let notional = 1000000.0
+  let rate = 0.05
+  let tolerance = 0.0000001
+
+  -- Test Case 1: Act/Act, non-leap year, semi-annual
+  -- Period: Jan 15, 2023 to Jul 15, 2023 (181 days in a 365-day year)
+  let startDate1 = fromGregorian 2023 Jan 15
+  let endDate1 = fromGregorian 2023 Jul 15
+  let cp1 = CouponPayment with
+        payingAgent = p, investor = p, issuer = p, bondId = "TestBond1"
+        notionalAmount = notional, couponRate = rate, couponPeriodStartDate = startDate1
+        couponPeriodEndDate = endDate1, paymentDate = endDate1, dayCountConvention = ActActISDA
+  cid1 <- submit p do create cp1
+  amount1 <- submit p do exercise cid1 CalculateCouponAmount
+  let expectedAmount1 = notional * rate * (181.0 / 365.0)
+  debug $ "Act/Act Non-Leap Year Test: Calculated=" <> show amount1 <> ", Expected=" <> show expectedAmount1
+  assert (abs (amount1 - expectedAmount1) < tolerance)
+
+  -- Test Case 2: Act/Act, leap year, semi-annual, period includes Feb 29
+  -- Period: Jan 15, 2024 to Jul 15, 2024 (182 days in a 366-day year)
+  let startDate2 = fromGregorian 2024 Jan 15
+  let endDate2 = fromGregorian 2024 Jul 15
+  let cp2 = cp1 with bondId = "TestBond2", couponPeriodStartDate = startDate2, couponPeriodEndDate = endDate2, paymentDate = endDate2
+  cid2 <- submit p do create cp2
+  amount2 <- submit p do exercise cid2 CalculateCouponAmount
+  let expectedAmount2 = notional * rate * (182.0 / 366.0)
+  debug $ "Act/Act Leap Year Test: Calculated=" <> show amount2 <> ", Expected=" <> show expectedAmount2
+  assert (abs (amount2 - expectedAmount2) < tolerance)
+
+  -- Test Case 3: Act/Act, crossing a year-end boundary from non-leap to leap
+  -- Period: Dec 1, 2023 to Jun 1, 2024
+  -- Dec 2023 part: 31 days / 365
+  -- Jan-May 2024 part: 152 days / 366
+  let startDate3 = fromGregorian 2023 Dec 1
+  let endDate3 = fromGregorian 2024 Jun 1
+  let cp3 = cp1 with bondId = "TestBond3", couponPeriodStartDate = startDate3, couponPeriodEndDate = endDate3, paymentDate = endDate3
+  cid3 <- submit p do create cp3
+  amount3 <- submit p do exercise cid3 CalculateCouponAmount
+  let expectedFraction3 = (31.0 / 365.0) + (152.0 / 366.0)
+  let expectedAmount3 = notional * rate * expectedFraction3
+  debug $ "Act/Act Year-Crossing Test: Calculated=" <> show amount3 <> ", Expected=" <> show expectedAmount3
+  assert (abs (amount3 - expectedAmount3) < tolerance)
+
+  -- Test Case 4: 30/360
+  -- Period: Feb 15, 2023 to Aug 15, 2023
+  -- (8-2)*30 + (15-15) = 180 days
+  let startDate4 = fromGregorian 2023 Feb 15
+  let endDate4 = fromGregorian 2023 Aug 15
+  let cp4 = cp1 with bondId = "TestBond4", couponPeriodStartDate = startDate4, couponPeriodEndDate = endDate4, paymentDate = endDate4, dayCountConvention = Thirty360
+  cid4 <- submit p do create cp4
+  amount4 <- submit p do exercise cid4 CalculateCouponAmount
+  let expectedAmount4 = notional * rate * (180.0 / 360.0)
+  debug $ "30/360 Test: Calculated=" <> show amount4 <> ", Expected=" <> show expectedAmount4
+  assert (abs (amount4 - expectedAmount4) < tolerance)
+
+  -- Test Case 5: Act/Act, crossing a year-end boundary from leap to non-leap
+  -- Period: Dec 1, 2024 to Jun 1, 2025
+  -- Dec 2024 part: 31 days / 366
+  -- Jan-May 2025 part: 151 days / 365
+  let startDate5 = fromGregorian 2024 Dec 1
+  let endDate5 = fromGregorian 2025 Jun 1
+  let cp5 = cp1 with bondId = "TestBond5", couponPeriodStartDate = startDate5, couponPeriodEndDate = endDate5, paymentDate = endDate5, dayCountConvention = ActActISDA
+  cid5 <- submit p do create cp5
+  amount5 <- submit p do exercise cid5 CalculateCouponAmount
+  let expectedFraction5 = (31.0 / 366.0) + (151.0 / 365.0)
+  let expectedAmount5 = notional * rate * expectedFraction5
+  debug $ "Act/Act Leap->Non-Leap Year-Crossing Test: Calculated=" <> show amount5 <> ", Expected=" <> show expectedAmount5
+  assert (abs (amount5 - expectedAmount5) < tolerance)
+
+  return ()
