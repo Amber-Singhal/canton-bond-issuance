@@ -4,122 +4,162 @@
 module BondTest where
 
 import Daml.Script
-
-import DA.Date
-import DA.Time
-import DA.RelTime qualified as RelTime
+import DA.Date as D
+import DA.Time as T
+import DA.Assert
 
 import Bond
-import BondIssuance
-import CouponPayment
-import Redemption
+import EarlyRedemption
 
--- | Tests the full lifecycle of a bond: issuance, subscription, coupon payment, and early redemption.
+-- | Main test script for the bond issuance and lifecycle workflow.
+-- This script covers:
+-- 1. Bond Specification creation by an Issuer.
+-- 2. Subscription to the bond by two investors, Alice and Bob.
+-- 3. The first coupon payment to Alice's holding.
+-- 4. Alice's request for early redemption and its settlement by the Issuer.
+-- 5. The full lifecycle for Bob, including all coupon payments and final redemption at maturity.
 bondLifecycleTest : Script ()
 bondLifecycleTest = script do
-  -- === 1. SETUP: ALLOCATE PARTIES AND DEFINE BOND PARAMETERS ===
-  debug "1. Setting up parties and bond parameters..."
-
-  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "Issuer")
-  agent <- allocatePartyWithHint "PayingAgent" (PartyIdHint "PayingAgent")
-  investor1 <- allocatePartyWithHint "Investor1" (PartyIdHint "Investor1")
+  -- === 1. SETUP: ALLOCATE PARTIES AND SET TIME ===
+  debug "1. Setting up parties and time."
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
+  csd <- allocatePartyWithHint "CSD" (PartyIdHint "csd")
+  payingAgent <- allocatePartyWithHint "PayingAgent" (PartyIdHint "payingagent")
+  investorAlice <- allocatePartyWithHint "InvestorAlice" (PartyIdHint "investoralice")
+  investorBob <- allocatePartyWithHint "InvestorBob" (PartyIdHint "investorbob")
 
   startTime <- getTime
-  let issueDate = toDateUTC startTime
-  let maturityDate = addDays 365 issueDate -- 1-year bond
-  let sixMonths = RelTime.months 6
-  let firstCouponDate = fromRelTime issueDate sixMonths
-
   let
-    bondDetails = Bond.Details with
-      id = "US000000AB12"
-      description = "Sample Corporate Bond 5.0% 2025"
-      currency = "USD"
-      faceValue = 1000.0
-      couponRate = 0.05 -- 5%
-      couponFrequency = sixMonths
-      maturityDate = maturityDate
-      issueDate = issueDate
+    today = D.toDateUTC startTime
+    issuanceDate = today
+    maturityDate = D.addYears 2 issuanceDate
+    firstCouponDate = D.addYears 1 issuanceDate
+    secondCouponDate = D.addYears 2 issuanceDate -- Coincides with maturity
 
-  -- === 2. ISSUANCE: ISSUER CREATES THE BOND ISSUANCE AND INVESTOR SUBSCRIBES ===
-  debug "2. Issuer creates BondIssuance contract..."
+  -- === 2. ISSUANCE: CREATE THE BOND SPECIFICATION ===
+  debug "2. Issuer creates BondSpecification."
+  let bondSpecPayload = BondSpecification with
+        issuer
+        csd
+        payingAgent
+        isin = "US-TEST-BOND-01"
+        currency = "USD"
+        faceValue = 1000.0
+        couponRate = 0.05 -- 5% annual coupon
+        couponFrequency = Annually
+        issuanceDate
+        maturityDate
+        couponDates = [firstCouponDate, secondCouponDate]
 
-  issuanceCid <- submit issuer do
-    createCmd BondIssuance with
-      issuer
-      agent
-      details = bondDetails
-      subscribers = []
+  specCid <- submit issuer do
+    createCmd bondSpecPayload
+  debug $ "Bond specification created with ISIN: " <> bondSpecPayload.isin
 
-  debug $ "BondIssuance created: " <> show issuanceCid
+  -- === 3. SUBSCRIPTION: ALICE BUYS THE BOND ===
+  debug "3. Alice subscribes to the bond."
+  let subscriptionQty = 10.0 -- Alice buys 10 units for a total of 10,000 USD face value
+  let subscriptionRequest = SubscriptionRequest with
+        investor = investorAlice
+        issuer
+        specCid
+        quantity = subscriptionQty
 
-  debug "Investor1 subscribes to the bond issuance..."
-  let purchaseQuantity = 10
-  (bondCid, _) <- submit investor1 do
-    exerciseCmd issuanceCid Subscribe with
-      subscriber = investor1
-      quantity = purchaseQuantity
+  subscriptionRequestCid <- submit investorAlice do
+    createCmd subscriptionRequest
 
-  debug $ "Investor1 subscribed, Bond contract created: " <> show bondCid
+  -- Issuer accepts the subscription, which creates the Holding contract.
+  aliceHoldingCid <- submit issuer do
+    exerciseCmd subscriptionRequestCid Accept
 
-  -- Verify bond contract state
-  bondContract <- fetch bondCid
-  debug $ "Fetched Bond contract: " <> show bondContract
-  assert (bondContract.owner == investor1)
-  assert (bondContract.details.faceValue == 1000.0)
-  assert (bondContract.quantity == purchaseQuantity)
-  assert (bondContract.lastCouponDate == issueDate)
-  assert (bondContract.nextCouponDate == firstCouponDate)
+  -- Verify the holding contract exists and has the correct state.
+  holding <- fetch aliceHoldingCid
+  assert (holding.investor == investorAlice)
+  assert (holding.quantity == subscriptionQty)
+  assert (holding.paidCoupons == [])
+  debug "Alice's holding created successfully."
 
+  -- === 4. COUPON PAYMENT: FIRST COUPON DATE ARRIVES ===
+  debug "4. Advancing time to first coupon date and paying coupon."
+  let firstCouponTime = T.time firstCouponDate 0 0 0
+  passTime (T.subTime firstCouponTime startTime)
 
-  -- === 3. COUPON PAYMENT: AGENT PROCESSES THE FIRST COUPON ===
-  debug "3. Processing first coupon payment..."
+  -- The Paying Agent initiates the coupon payment.
+  aliceHoldingCidV2 <- submit payingAgent do
+    exerciseCmd aliceHoldingCid PayCoupon with paymentDate = firstCouponDate
 
-  -- Advance time to be just after the first coupon date
-  let daysToPass = daysBetween firstCouponDate issueDate
-  passTime (RelTime.seconds (intToDecimal (daysToPass + 1) * 24 * 60 * 60))
+  -- Verify the holding's paid coupon list has been updated.
+  holdingV2 <- fetch aliceHoldingCidV2
+  assert (holdingV2.paidCoupons == [firstCouponDate])
+  debug "First coupon paid to Alice."
 
-  let expectedCouponAmount = bondContract.details.faceValue * intToDecimal bondContract.quantity * bondContract.details.couponRate / 2.0 -- semi-annual
-  debug $ "Expected coupon amount: " <> show expectedCouponAmount
+  -- Test failure case: attempt to pay the same coupon twice.
+  submit payingAgent do
+    exerciseCmd aliceHoldingCidV2 (PayCoupon with paymentDate = firstCouponDate)
+    `mustFail`
+  debug "Verified that double-paying a coupon fails as expected."
 
-  -- The Agent initiates the coupon payment process for the specific bond holding.
-  paymentCid <- submitMustFail agent do
-    exerciseCmd bondCid InitiateCouponPayment
-  debug $ "CouponPayment contract created by agent: " <> show paymentCid
+  -- === 5. EARLY REDEMPTION: ALICE REQUESTS TO EXIT ===
+  debug "5. Alice requests early redemption."
+  passTime (days 30) -- Advance time slightly past the coupon date
 
-  -- Investor claims the payment
-  debug "Investor1 claims the coupon payment..."
-  _ <- submit investor1 do
-    exerciseCmd paymentCid ClaimPayment
+  let earlyRedemptionReason = "Investor requires liquidity."
+  earlyRedemptionRequestCid <- submit investorAlice do
+    exerciseCmd aliceHoldingCidV2 RequestEarlyRedemption with
+      reason = earlyRedemptionReason
 
-  debug "Coupon payment claimed."
+  -- Verify the request contract has been created.
+  redemptionRequest <- fetch earlyRedemptionRequestCid
+  assert (redemptionRequest.investor == investorAlice)
+  assert (redemptionRequest.holdingCid == aliceHoldingCidV2)
+  assert (redemptionRequest.reason == earlyRedemptionReason)
+  debug "Early redemption request created."
 
-  -- Verify the bond's coupon dates have been updated
-  updatedBondContract <- fetch bondCid
-  let secondCouponDate = fromRelTime firstCouponDate sixMonths
-  debug $ "Fetched updated Bond contract: " <> show updatedBondContract
-  assert (updatedBondContract.lastCouponDate == firstCouponDate)
-  assert (updatedBondContract.nextCouponDate == secondCouponDate)
+  -- === 6. SETTLEMENT: ISSUER SETTLES THE REDEMPTION ===
+  debug "6. Issuer settles the early redemption."
+  -- In a real scenario, this involves a Delivery-vs-Payment (DVP) transaction.
+  let settlementPrice = 10041.10 -- Principal + 30 days of accrued interest
+  submit issuer do
+    exerciseCmd earlyRedemptionRequestCid SettleEarlyRedemption with
+      settlementPrice
 
+  -- Verify that both the Holding and the RedemptionRequest contracts are archived.
+  fetch aliceHoldingCidV2 `mustFail`
+  fetch earlyRedemptionRequestCid `mustFail`
+  debug "Alice's holding and redemption request successfully settled and archived."
 
-  -- === 4. EARLY REDEMPTION: INVESTOR REQUESTS AND ISSUER ACCEPTS ===
-  debug "4. Initiating early redemption..."
+  -- === 7. MATURITY REDEMPTION (BOB'S HOLDING) ===
+  debug "7. Testing maturity redemption path with Bob's holding."
+  -- Bob subscribes to the same bond at issuance time.
+  bobSubReqCid <- submit investorBob do
+    createCmd (subscriptionRequest with investor = investorBob, quantity = 5.0)
 
-  debug "Investor1 requests early redemption..."
-  redemptionRequestCid <- submit investor1 do
-    exerciseCmd bondCid RequestRedemption
+  bobHoldingCid <- submit issuer do
+    exerciseCmd bobSubReqCid Accept
+  debug "Bob's holding created."
 
-  debug $ "RedemptionRequest created: " <> show redemptionRequestCid
+  -- Advance time to the maturity date.
+  currentTime <- getTime
+  let maturityTime = T.time maturityDate 0 0 0
+  passTime (T.subTime maturityTime currentTime)
 
-  -- Issuer accepts the redemption request
-  debug "Issuer accepts the redemption request..."
-  _ <- submit issuer do
-    exerciseCmd redemptionRequestCid AcceptRedemptionRequest
+  -- The Paying Agent first pays all outstanding coupons up to maturity.
+  bobHoldingCidV2 <- submit payingAgent do
+    exerciseCmd bobHoldingCid PayCoupon with paymentDate = firstCouponDate
+  bobHoldingCidV3 <- submit payingAgent do
+    exerciseCmd bobHoldingCidV2 PayCoupon with paymentDate = secondCouponDate
+  debug "All coupons paid to Bob."
 
-  debug "Redemption complete. Verifying bond contract is archived."
+  holdingV3 <- fetch bobHoldingCidV3
+  assert (holdingV3.paidCoupons == [firstCouponDate, secondCouponDate])
 
-  -- Verify the bond contract has been archived
-  matchingBond <- queryContractId investor1 bondCid
-  assertMsg ("Expected bond contract " <> show bondCid <> " to be archived, but it was found.") (matchingBond == None)
+  -- The Paying Agent then triggers the final redemption at maturity.
+  submit payingAgent do
+    exerciseCmd bobHoldingCidV3 RedeemAtMaturity
+  debug "Bob's holding redeemed at maturity."
+
+  -- Verify Bob's holding contract is archived.
+  fetch bobHoldingCidV3 `mustFail`
+  debug "Verified Bob's holding is archived."
 
   debug "Bond lifecycle test completed successfully."
+  pure ()
