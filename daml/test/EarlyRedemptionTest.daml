@@ -4,190 +4,191 @@
 module EarlyRedemptionTest where
 
 import Daml.Script
-import DA.Date as D
-import DA.Time as T
-import DA.Assert
-import DA.Optional (isSome, fromSome)
-import qualified DA.Set as Set
+import DA.Date
+import DA.Date.Types (Month(..))
+import DA.Time (time)
 
-import EarlyRedemption (EarlyRedemptionProposal(..))
-import Bond (Bond(..), BondData(..))
-import Fungible (Asset(..))
+import EarlyRedemption
+import Bond (Bond(..)) -- Assuming a core Bond template exists in Bond.daml
 
--- | Main entry point for the test script.
+earlyRedemptionTests : Script ()
 earlyRedemptionTests = script do
+  -- === Setup parties and time ===
+  let now = time (date 2024 Jan 01) 0 0 0
+  setTime now
+
   issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
-  bondholder <- allocatePartyWithHint "Bondholder" (PartyIdHint "bondholder")
-  stranger <- allocatePartyWithHint "Stranger" (PartyIdHint "stranger")
+  investor <- allocatePartyWithHint "Investor" (PartyIdHint "investor")
+  agent <- allocatePartyWithHint "PayingAgent" (PartyIdHint "paying-agent")
+  regulator <- allocatePartyWithHint "Regulator" (PartyIdHint "regulator")
 
-  -- Use a fixed date for deterministic tests
-  let today = D.date 2024 Jul 19
-  setTime (T.time today 0 0 0)
-
+  -- === Bond parameters ===
   let
-    -- Realistic bond data with a call schedule
-    bondData = BondData with
-      isin = "US084664AS34" -- Example callable bond ISIN (Berkshire Hathaway)
-      currency = "USD"
-      faceValue = 1_000_000.0
-      maturityDate = D.date 2030 Jan 15
-      couponRate = 0.05
-      couponFrequency = "Semi-Annually"
-      paymentDates = [] -- Not relevant for this test
-      dayCountConvention = "30/360"
-      callSchedule = Some [(D.date 2025 Jan 15, 101.0), (D.date 2026 Jan 15, 100.5)]
+    issueDate = date 2024 Jan 15
+    maturityDate = date 2029 Jan 15
+    firstCallDate = date 2026 Jan 15
+    secondCallDate = date 2027 Jan 15
 
-    callDate = D.date 2025 Jan 15
-    callPrice = 101.0
-    redemptionAmount = bondData.faceValue * callPrice / 100.0 -- 1,010,000.0
-
-  -- Test helper to set up a clean state for each test: a bond held by the
-  -- bondholder and enough cash held by the issuer for redemption.
-  let setup = script do
-    bondCid <- submit issuer do
-      createCmd Bond with
+    bond = Bond
+      with
         issuer
-        owner = bondholder
-        data = bondData
-        observers = Set.empty
+        investor
+        agent
+        observers = [regulator]
+        isin = "CH0123456789"
+        currency = "USD"
+        principal = 1_000_000.0
+        couponRate = 0.05
+        issueDate
+        maturityDate
+        lastCouponDate = issueDate
+        couponPeriodMonths = 6
+        dayCountConvention = "ACT/365"
 
-    cashCid <- submit issuer do
-      createCmd Fungible.Asset with
-        issuer
-        owner = issuer
-        quantity = redemptionAmount
-        description = bondData.currency
-        observers = Set.empty
+    callSchedule =
+      [ CallDate with date = firstCallDate, price = 1.02 -- Callable at 102% of principal
+      , CallDate with date = secondCallDate, price = 1.01 -- Callable at 101% of principal
+      ]
 
-    return (bondCid, cashCid)
+  -- === Helper to create a clean slate for each test ===
+  let setupTest = do
+        bondCid <- submit issuer do
+          createCmd bond
+        rightCid <- submit issuer do
+          createCmd EarlyRedemptionRight with issuer, investor, bond, bondCid, callSchedule
+        return (bondCid, rightCid)
 
-  test "Happy Path: Successful early redemption proposal, acceptance, and settlement" do
-    (bondCid, cashCid) <- setup
+  -- === Test Scenarios ===
 
-    -- Issuer proposes early redemption, referencing the bond and payment asset.
-    proposalCid <- submit issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with
-        callDate
-        callPrice
-        paymentAssetCid = cashCid
+  test "Successful early redemption on first call date" do
+    (bondCid, rightCid) <- setupTest
 
-    -- Verify the proposal contract exists with correct terms.
-    proposal <- queryContractId issuer proposalCid
-    proposal.issuer === issuer
-    proposal.bondholder === bondholder
-    proposal.callDate === callDate
-    proposal.callPrice === callPrice
-    proposal.paymentAssetCid === cashCid
+    -- Set time to the first call date
+    let redemptionTime = time firstCallDate 0 0 0
+    setTime redemptionTime
 
-    -- The bondholder accepts the proposal.
-    submit bondholder do exerciseCmd proposalCid Accept
+    -- Issuer exercises the redemption right
+    settlementCid <- submit issuer do
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = firstCallDate
 
-    -- Verify the bond is redeemed (archived) from the bondholder's view.
-    queryContractId bondholder bondCid >>= \c -> c === None
+    -- Verify the settlement instruction
+    settlement <- fetch settlementCid
+    let
+      -- Accrued interest calculation for 2 years (2024-01-15 to 2026-01-15)
+      -- Note: In a real scenario, this would depend on the last coupon payment.
+      -- Here we simplify assuming interest accrues from the issue date.
+      daysAccrued = daysInDateRange issueDate firstCallDate
+      expectedInterest = bond.principal * bond.couponRate * (intToDecimal daysAccrued / 365.0)
+      expectedRedemptionPrice = bond.principal * 1.02 -- From call schedule
+      expectedAmount = expectedRedemptionPrice + expectedInterest
 
-    -- Verify the proposal is consumed.
-    queryContractId issuer proposalCid >>= \c -> c === None
+    settlement.payer === issuer
+    settlement.receiver === investor
+    settlement.settlementDate === firstCallDate
+    settlement.amount === expectedAmount
+    settlement.currency === bond.currency
+    settlement.bondCid === bondCid
 
-    -- Verify the payment asset was successfully transferred to the bondholder.
-    -- The specific contract ID of the new asset is not known beforehand, so we query by template.
-    bondholderCash <- queryContracts (Party bondholder)
-    case filter (\c -> c.payload.description == bondData.currency) bondholderCash of
-      [newCashContract] -> do
-        newCashContract.payload.owner === bondholder
-        newCashContract.payload.quantity === redemptionAmount
-      other -> assertFailure $ "Expected exactly one cash contract for bondholder, but found: " <> show other
+    -- Verify the redemption right contract is consumed
+    query @EarlyRedemptionRight issuer >>= \rights ->
+      assert (null rights)
 
-  test "Rejection: Bondholder rejects the early redemption proposal" do
-    (bondCid, cashCid) <- setup
 
-    proposalCid <- submit issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = cashCid
+  test "Unauthorized party cannot exercise redemption right" do
+    (_bondCid, rightCid) <- setupTest
 
-    -- The bondholder explicitly rejects the proposal.
-    submit bondholder do exerciseCmd proposalCid Reject
+    -- Set time to a valid call date
+    let redemptionTime = time firstCallDate 0 0 0
+    setTime redemptionTime
 
-    -- Verify proposal is consumed.
-    queryContractId issuer proposalCid >>= \c -> c === None
+    -- Investor tries to exercise the right, which should fail
+    submitMustFail investor do
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = firstCallDate
 
-    -- Verify the original bond contract still exists and is active.
-    queryContractId bondholder bondCid >>= \c -> isSome c === True
 
-    -- Verify the cash asset has not moved and is still owned by the issuer.
-    cash <- fetch cashCid
-    cash.owner === issuer
+  test "Redemption fails if attempted before call date" do
+    (_bondCid, rightCid) <- setupTest
 
-  test "Withdrawal: Issuer withdraws the early redemption proposal" do
-    (bondCid, cashCid) <- setup
+    -- Set time to one day before the first call date
+    let earlyAttemptDate = addDays firstCallDate (-1)
+    let earlyAttemptTime = time earlyAttemptDate 0 0 0
+    setTime earlyAttemptTime
 
-    proposalCid <- submit issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = cashCid
-
-    -- The issuer withdraws the proposal before it is actioned.
-    submit issuer do exerciseCmd proposalCid Withdraw
-
-    -- Verify proposal is consumed.
-    queryContractId issuer proposalCid >>= \c -> c === None
-
-    -- Verify the original bond contract still exists and is active.
-    queryContractId bondholder bondCid >>= \c -> isSome c === True
-
-  test "Authorization: Proposal choices fail for unauthorized parties" do
-    (bondCid, cashCid) <- setup
-
-    proposalCid <- submit issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = cashCid
-
-    -- A third-party stranger cannot exercise any choices.
-    submitMustFail stranger do exerciseCmd proposalCid Accept
-    submitMustFail stranger do exerciseCmd proposalCid Reject
-    submitMustFail stranger do exerciseCmd proposalCid Withdraw
-
-    -- The issuer can only withdraw their own proposal.
-    submitMustFail issuer do exerciseCmd proposalCid Accept
-    submitMustFail issuer do exerciseCmd proposalCid Reject
-
-    -- The bondholder can only accept or reject, not withdraw.
-    submitMustFail bondholder do exerciseCmd proposalCid Withdraw
-
-  test "Validation: Acceptance fails if payment amount is incorrect" do
-    (bondCid, _cashCid) <- setup
-
-    -- Create a cash asset with an amount that is insufficient for the redemption.
-    incorrectCashCid <- submit issuer do
-      createCmd Fungible.Asset with
-        issuer
-        owner = issuer
-        quantity = redemptionAmount - 1.0 -- Incorrect amount
-        description = bondData.currency
-        observers = Set.empty
-
-    proposalCid <- submit issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with callDate, callPrice, paymentAssetCid = incorrectCashCid
-
-    -- The `Accept` choice should contain an assertion that verifies the payment amount
-    -- against the bond face value and call price.
-    submitMustFail bondholder do exerciseCmd proposalCid Accept
-
-  test "Validation: Proposal fails if call date is not in the schedule" do
-    (bondCid, cashCid) <- setup
-
-    let invalidCallDate = D.date 2025 Feb 01 -- A date not specified in the call schedule
-    -- The `ProposeEarlyRedemption` choice on the Bond should validate that the
-    -- proposed date is part of the bond's callable terms.
+    -- Issuer tries to exercise the right early, which should fail
     submitMustFail issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with
-        callDate = invalidCallDate
-        callPrice
-        paymentAssetCid = cashCid
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = firstCallDate
 
-  test "Validation: Proposal fails if call price is incorrect for the given date" do
-    (bondCid, cashCid) <- setup
 
-    let wrongCallPrice = 101.1 -- Incorrect price for the 2025-01-15 call date
-    -- The `ProposeEarlyRedemption` choice should also validate that the provided price
-    -- matches the schedule for the given date.
+  test "Redemption fails for a date not in the call schedule" do
+    (_bondCid, rightCid) <- setupTest
+    let invalidCallDate = addDays firstCallDate 1
+    let attemptTime = time firstCallDate 0 0 0 -- The current time is valid
+    setTime attemptTime
+
+    -- Issuer tries to exercise for a date that isn't on the schedule
     submitMustFail issuer do
-      exerciseCmd bondCid ProposeEarlyRedemption with
-        callDate
-        callPrice = wrongCallPrice
-        paymentAssetCid = cashCid
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = invalidCallDate
+
+
+  test "Successful early redemption on second call date" do
+    (bondCid, rightCid) <- setupTest
+
+    -- Set time to the second call date
+    let redemptionTime = time secondCallDate 0 0 0
+    setTime redemptionTime
+
+    -- Issuer exercises the redemption right
+    settlementCid <- submit issuer do
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = secondCallDate
+
+    -- Verify the settlement instruction
+    settlement <- fetch settlementCid
+    let
+      daysAccrued = daysInDateRange issueDate secondCallDate
+      expectedInterest = bond.principal * bond.couponRate * (intToDecimal daysAccrued / 365.0)
+      expectedRedemptionPrice = bond.principal * 1.01 -- Price for the second call date
+      expectedAmount = expectedRedemptionPrice + expectedInterest
+
+    settlement.payer === issuer
+    settlement.receiver === investor
+    settlement.settlementDate === secondCallDate
+    settlement.amount === expectedAmount
+    settlement.bondCid === bondCid
+
+
+  test "Settlement instruction can be accepted by the investor" do
+    (_bondCid, rightCid) <- setupTest
+    let redemptionTime = time firstCallDate 0 0 0
+    setTime redemptionTime
+
+    settlementCid <- submit issuer do
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = firstCallDate
+
+    -- Investor accepts the settlement instruction
+    settlementConfirmationCid <- submit investor do
+      exerciseCmd settlementCid AcceptSettlement
+
+    -- Verify confirmation details
+    confirmation <- fetch settlementConfirmationCid
+    confirmation.payer === issuer
+    confirmation.receiver === investor
+    confirmation.settlementDate === firstCallDate
+
+    -- Verify the settlement instruction is consumed
+    query @EarlyRedemptionSettlementInstruction investor >>= \instructions ->
+      assert (null instructions)
+
+
+  test "Redemption fails if bond has already been redeemed" do
+    (bondCid, rightCid) <- setupTest
+    let redemptionTime = time firstCallDate 0 0 0
+    setTime redemptionTime
+
+    -- First, successfully exercise the redemption
+    settlementCid <- submit issuer do
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = firstCallDate
+
+    -- At this point, `rightCid` is archived. Any attempt to use it again will fail.
+    -- This tests that the contract was correctly consumed.
+    submitMustFail issuer do
+      exerciseCmd rightCid ExerciseEarlyRedemption with callDate = firstCallDate
