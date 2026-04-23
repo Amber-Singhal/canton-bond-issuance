@@ -1,327 +1,272 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useMemo } from 'react';
 import { DamlLedger, useParty, useLedger, useStreamQueries } from '@c7/react';
-import { Bond } from './bondService'; // Assuming types are exported from here
-import { BondCard } from './BondCard';
-import { issueBond, subscribeToBond, payCoupon, redeemBond } from './bondService';
-import './App.css';
+// These imports assume codegen has been run for a package named 'canton-bond-issuance'
+// containing a module named 'Bond'.
+// Run `dpm codegen-js` to generate these types.
+import { Bond, Issuance } from '@canton-bond-issuance/daml-codegen/dist/Bond';
+import { Party } from '@daml/types';
 
-// --- Type Definitions ---
-
-type Credentials = {
-  party: string;
-  token: string;
+/**
+ * Generates a dummy JWT for local development against a sandbox.
+ * In a production environment, this would be replaced by a proper authentication flow
+ * (e.g., OAuth2, OpenID Connect, or CIP-0103 for wallet integration) that provides a valid token.
+ * @param party The party ID to embed in the token.
+ * @returns A JWT string with actAs and readAs claims for the given party.
+ */
+const generateToken = (party: Party): string => {
+  const payload = {
+    "https://daml.com/ledger-api": {
+      "ledgerId": "sandbox", // This should match your ledger's ID
+      "applicationId": "canton-bond-issuance-app",
+      "actAs": [party],
+      "readAs": [party]
+    }
+  };
+  const header = window.btoa(JSON.stringify({ alg: 'none', typ: 'JWT' }));
+  const body = window.btoa(JSON.stringify(payload));
+  return `${header}.${body}.`;
 };
 
-// --- Helper Components ---
+// --- React Components ---
 
-const LoginScreen: React.FC<{ onLogin: (creds: Credentials) => void }> = ({ onLogin }) => {
-  const [party, setParty] = useState('');
-  const [token, setToken] = useState('');
+const LoginScreen: React.FC<{ onLogin: (party: Party, token: string) => void }> = ({ onLogin }) => {
+  const [partyId, setPartyId] = useState('');
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (party && token) {
-      onLogin({ party, token });
+    if (partyId.trim() === '') {
+      alert('Please enter a Party ID');
+      return;
     }
+    const token = generateToken(partyId);
+    onLogin(partyId, token);
   };
 
   return (
-    <div className="login-container">
-      <div className="login-box">
-        <h2>Canton Bond Platform</h2>
-        <p>Login with your Party ID and JWT Token</p>
-        <form onSubmit={handleLogin}>
-          <div className="form-group">
-            <label htmlFor="party">Party ID</label>
-            <input
-              id="party"
-              type="text"
-              className="input-field"
-              value={party}
-              onChange={(e) => setParty(e.target.value)}
-              placeholder="e.g., Alice::1220..."
-            />
-          </div>
-          <div className="form-group">
-            <label htmlFor="token">Auth Token (JWT)</label>
-            <input
-              id="token"
-              type="password"
-              className="input-field"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder="Paste your token here"
-            />
-          </div>
-          <button type="submit" className="button button-primary">Login</button>
-        </form>
-      </div>
+    <div style={styles.loginContainer}>
+      <h2>Bond Issuance & Management Dashboard</h2>
+      <form onSubmit={handleLogin} style={styles.loginForm}>
+        <input
+          type="text"
+          placeholder="Enter Party ID (e.g., Issuer, Investor1)"
+          value={partyId}
+          onChange={(e) => setPartyId(e.target.value)}
+          style={styles.input}
+        />
+        <button type="submit" style={styles.button}>Login</button>
+      </form>
     </div>
   );
 };
 
-const NewBondForm: React.FC<{ onIssue: () => void }> = ({ onIssue }) => {
-    const ledger = useLedger();
-    const party = useParty();
-    const [formData, setFormData] = useState({
-      bondId: '',
-      currency: 'USD',
-      faceValue: '1000.0',
-      couponRate: '0.05',
-      maturityDate: '',
-      paymentFrequencyMonths: '6',
-    });
-    const [isSubmitting, setIsSubmitting] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+const MainView: React.FC = () => {
+  const party = useParty();
+  const ledger = useLedger();
+  const { contracts: bonds, loading: bondsLoading } = useStreamQueries(Bond);
+  const { contracts: issuances, loading: issuancesLoading } = useStreamQueries(Issuance);
 
-    const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-        const { name, value } = e.target;
-        setFormData(prev => ({ ...prev, [name]: value }));
+  const [showIssuanceForm, setShowIssuanceForm] = useState(false);
+
+  const handleSubscribe = async (issuanceCid: string, amount: string) => {
+    const faceValue = parseFloat(amount);
+    if (isNaN(faceValue) || faceValue <= 0) {
+      alert("Please enter a valid subscription amount.");
+      return;
+    }
+    try {
+      await ledger.exercise(Issuance.Subscribe, issuanceCid, { faceValue: faceValue.toFixed(10) });
+      alert("Subscription successful!");
+    } catch (error) {
+      console.error("Subscription failed:", error);
+      alert(`Subscription failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+  };
+
+  return (
+    <div style={styles.mainContainer}>
+      <header style={styles.header}>
+        <h1>Bond Dashboard</h1>
+        <div>
+          <span>Logged in as: <strong>{party}</strong></span>
+          <button onClick={() => setShowIssuanceForm(!showIssuanceForm)} style={{...styles.button, marginLeft: '20px'}}>
+            {showIssuanceForm ? 'Close Issuance Form' : 'Create New Bond Issuance'}
+          </button>
+        </div>
+      </header>
+
+      {showIssuanceForm && <BondIssuanceForm onClose={() => setShowIssuanceForm(false)} />}
+
+      <section style={styles.section}>
+        <h2>My Bond Portfolio</h2>
+        {bondsLoading ? <p>Loading portfolio...</p> : (
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>ISIN</th>
+                <th style={styles.th}>Issuer</th>
+                <th style={styles.th}>Face Value</th>
+                <th style={styles.th}>Coupon Rate</th>
+                <th style={styles.th}>Maturity Date</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bonds.length === 0 ? (
+                <tr><td colSpan={5} style={styles.td}>No bonds in portfolio.</td></tr>
+              ) : bonds.map(bond => (
+                <tr key={bond.contractId}>
+                  <td style={styles.td}>{bond.payload.isin}</td>
+                  <td style={styles.td}>{bond.payload.issuer}</td>
+                  <td style={styles.td}>{parseFloat(bond.payload.faceValue).toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+                  <td style={styles.td}>{(parseFloat(bond.payload.couponRate) * 100).toFixed(2)}%</td>
+                  <td style={styles.td}>{bond.payload.maturityDate}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section style={styles.section}>
+        <h2>Available Bond Issuances</h2>
+        {issuancesLoading ? <p>Loading issuances...</p> : (
+          <div style={styles.issuanceList}>
+            {issuances.length === 0 ? (
+              <p>No active bond issuances available for subscription.</p>
+            ) : issuances.map(issuance => (
+              <div key={issuance.contractId} style={styles.issuanceCard}>
+                <h3>{issuance.payload.isin}</h3>
+                <p><strong>Issuer:</strong> {issuance.payload.issuer}</p>
+                <p><strong>Total Size:</strong> {parseFloat(issuance.payload.issueSize).toLocaleString(undefined, {minimumFractionDigits: 2})}</p>
+                <p><strong>Subscribed:</strong> {parseFloat(issuance.payload.subscribedAmount).toLocaleString(undefined, {minimumFractionDigits: 2})}</p>
+                <p><strong>Coupon:</strong> {(parseFloat(issuance.payload.couponRate) * 100).toFixed(2)}%</p>
+                <p><strong>Maturity:</strong> {issuance.payload.maturityDate}</p>
+                <form onSubmit={(e) => {
+                    e.preventDefault();
+                    const amount = (e.currentTarget.elements.namedItem('amount') as HTMLInputElement).value;
+                    handleSubscribe(issuance.contractId, amount);
+                }}>
+                  <input name="amount" type="number" step="1000" min="1000" placeholder="Subscription Amount" style={styles.input} required/>
+                  <button type="submit" style={styles.button}>Subscribe</button>
+                </form>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+};
+
+
+const BondIssuanceForm: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+    const party = useParty();
+    const ledger = useLedger();
+    const [formData, setFormData] = useState({
+        isin: '',
+        issueSize: '',
+        couponRate: '',
+        maturityDate: new Date(new Date().setFullYear(new Date().getFullYear() + 5)).toISOString().split('T')[0], // 5 years from now
+        payingAgent: '',
+        subscriptionEndDate: new Date(new Date().setDate(new Date().getDate() + 30)).toISOString().split('T')[0], // 30 days from now
+    });
+
+    const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        setFormData({ ...formData, [e.target.name]: e.target.value });
     };
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        setError(null);
-        setIsSubmitting(true);
         try {
-            const maturityDate = new Date(formData.maturityDate).toISOString().split('T')[0];
-            await issueBond(ledger, {
+            await ledger.create(Issuance, {
                 issuer: party,
-                bondId: formData.bondId,
-                currency: formData.currency,
-                faceValue: formData.faceValue,
-                couponRate: formData.couponRate,
-                maturityDate: maturityDate,
-                paymentFrequencyMonths: parseInt(formData.paymentFrequencyMonths)
+                payingAgent: formData.payingAgent,
+                isin: formData.isin,
+                issueSize: parseFloat(formData.issueSize).toFixed(10),
+                faceValue: "1000.0000000000",
+                couponRate: (parseFloat(formData.couponRate) / 100).toFixed(10),
+                maturityDate: formData.maturityDate,
+                subscriptionWindow: {
+                    start: new Date().toISOString(),
+                    end: new Date(formData.subscriptionEndDate).toISOString(),
+                },
+                subscribedAmount: "0.0000000000",
+                investors: [],
             });
-            onIssue(); // Callback to refresh or notify parent
-            setFormData({ // Reset form
-                bondId: '',
-                currency: 'USD',
-                faceValue: '1000.0',
-                couponRate: '0.05',
-                maturityDate: '',
-                paymentFrequencyMonths: '6',
-            });
-        } catch (err: any) {
-            setError(err.message || 'Failed to issue bond.');
-        } finally {
-            setIsSubmitting(false);
+            alert('Bond Issuance created successfully!');
+            onClose();
+        } catch (error) {
+            console.error('Failed to create bond issuance:', error);
+            alert(`Failed to create bond issuance: ${error instanceof Error ? error.message : "Unknown error"}`);
         }
     };
 
     return (
-        <div className="form-container">
-            <h3>Issue New Bond</h3>
-            <form onSubmit={handleSubmit}>
-                <div className="form-grid">
-                    <div className="form-group">
-                        <label>Bond ID / ISIN</label>
-                        <input name="bondId" value={formData.bondId} onChange={handleChange} required />
+        <div style={styles.modalBackdrop}>
+            <div style={styles.modalContent}>
+                <h2>New Bond Issuance</h2>
+                <form onSubmit={handleSubmit}>
+                    <input name="isin" value={formData.isin} onChange={handleChange} placeholder="ISIN (e.g., US0378331005)" required style={styles.input} />
+                    <input name="issueSize" type="number" value={formData.issueSize} onChange={handleChange} placeholder="Total Issue Size" required style={styles.input} />
+                    <input name="couponRate" type="number" step="0.01" value={formData.couponRate} onChange={handleChange} placeholder="Coupon Rate (%)" required style={styles.input} />
+                    <input name="maturityDate" type="date" value={formData.maturityDate} onChange={handleChange} placeholder="Maturity Date" required style={styles.input} />
+                    <input name="payingAgent" value={formData.payingAgent} onChange={handleChange} placeholder="Paying Agent Party ID" required style={styles.input} />
+                    <input name="subscriptionEndDate" type="date" value={formData.subscriptionEndDate} onChange={handleChange} placeholder="Subscription End Date" required style={styles.input} />
+                    <div style={styles.formActions}>
+                        <button type="submit" style={styles.button}>Create Issuance</button>
+                        <button type="button" onClick={onClose} style={{...styles.button, ...styles.buttonSecondary}}>Cancel</button>
                     </div>
-                    <div className="form-group">
-                        <label>Currency</label>
-                        <input name="currency" value={formData.currency} onChange={handleChange} required />
-                    </div>
-                    <div className="form-group">
-                        <label>Face Value</label>
-                        <input type="number" name="faceValue" value={formData.faceValue} onChange={handleChange} required />
-                    </div>
-                    <div className="form-group">
-                        <label>Coupon Rate (e.g., 0.05 for 5%)</label>
-                        <input type="number" step="0.001" name="couponRate" value={formData.couponRate} onChange={handleChange} required />
-                    </div>
-                    <div className="form-group">
-                        <label>Maturity Date</label>
-                        <input type="date" name="maturityDate" value={formData.maturityDate} onChange={handleChange} required />
-                    </div>
-                    <div className="form-group">
-                        <label>Payment Frequency (Months)</label>
-                        <select name="paymentFrequencyMonths" value={formData.paymentFrequencyMonths} onChange={handleChange}>
-                            <option value="3">Quarterly</option>
-                            <option value="6">Semi-Annually</option>
-                            <option value="12">Annually</option>
-                        </select>
-                    </div>
-                </div>
-                <button type="submit" className="button button-primary" disabled={isSubmitting}>
-                    {isSubmitting ? 'Issuing...' : 'Issue Bond'}
-                </button>
-                {error && <p className="error-message">{error}</p>}
-            </form>
+                </form>
+            </div>
         </div>
     );
 };
 
 
-// --- Main Application Components ---
+// --- App Entry Point ---
 
-const MainScreen: React.FC<{ onLogout: () => void }> = ({ onLogout }) => {
-  const party = useParty();
-  const ledger = useLedger();
-  const [activeTab, setActiveTab] = useState('portfolio');
+const App: React.FC = () => {
+  const [credentials, setCredentials] = useState<{ party: Party; token: string } | undefined>();
 
-  const { contracts: bonds, loading: bondsLoading } = useStreamQueries(Bond);
+  // Determine the WebSocket URL from the current page's URL
+  const wsUrl = useMemo(() => {
+    const url = new URL(window.location.href);
+    url.protocol = url.protocol.replace('http', 'ws');
+    // The @c7/react ledger client connects to this streaming endpoint
+    url.pathname = '/v2/stream/updates';
+    return url.toString();
+  }, []);
 
-  const myIssuedBonds = bonds.filter(b => b.payload.issuer === party);
-  const myPortfolio = bonds.filter(b => b.payload.owner === party && b.payload.issuer !== party);
-  const marketplaceBonds = bonds.filter(b => b.payload.owner === b.payload.issuer); // Bonds still held by issuer are available for subscription
-
-  const handleAction = async (action: Promise<any>, successMessage: string) => {
-    try {
-      await action;
-      alert(successMessage);
-    } catch (err: any) {
-      console.error(err);
-      alert(`Action failed: ${err.message}`);
-    }
-  };
-
-  const renderContent = () => {
-    if (bondsLoading) {
-      return <div className="loading">Loading contracts...</div>;
-    }
-    switch (activeTab) {
-      case 'marketplace':
-        return (
-          <div className="card-grid">
-            {marketplaceBonds.length > 0 ? marketplaceBonds.map(bond => (
-              <BondCard
-                key={bond.contractId}
-                bond={bond.payload}
-                actions={[{
-                  label: 'Subscribe',
-                  handler: () => handleAction(
-                    subscribeToBond(ledger, bond.contractId),
-                    'Successfully subscribed to bond!'
-                  ),
-                  condition: bond.payload.owner === bond.payload.issuer
-                }]}
-              />
-            )) : <p>No new bonds available in the marketplace.</p>}
-          </div>
-        );
-      case 'portfolio':
-        return (
-          <div className="card-grid">
-            {myPortfolio.length > 0 ? myPortfolio.map(bond => (
-              <BondCard
-                key={bond.contractId}
-                bond={bond.payload}
-                isOwner={true}
-                actions={[]} // Could add actions like 'Sell' in a future version
-              />
-            )) : <p>You do not own any bonds yet. Visit the Marketplace to subscribe.</p>}
-          </div>
-        );
-      case 'issuer':
-        return (
-          <div>
-            <NewBondForm onIssue={() => { /* Data will refetch automatically via streams */ }} />
-            <h2 className="section-title">My Issued Bonds</h2>
-            <div className="card-grid">
-              {myIssuedBonds.length > 0 ? myIssuedBonds.map(bond => (
-                <BondCard
-                  key={bond.contractId}
-                  bond={bond.payload}
-                  isIssuer={true}
-                  actions={[
-                    {
-                      label: `Pay Coupon (${bond.payload.currency} ${bond.payload.couponAmount})`,
-                      handler: () => handleAction(
-                        payCoupon(ledger, bond.contractId),
-                        'Coupon payment dispatched!'
-                      ),
-                      condition: true // Add logic based on next payment date if needed
-                    },
-                    {
-                      label: `Redeem Bond (${bond.payload.currency} ${bond.payload.faceValue})`,
-                      handler: () => handleAction(
-                        redeemBond(ledger, bond.contractId),
-                        'Bond successfully redeemed!'
-                      ),
-                      condition: new Date() >= new Date(bond.payload.maturityDate)
-                    }
-                  ]}
-                />
-              )) : <p>You have not issued any bonds.</p>}
-            </div>
-          </div>
-        );
-      default:
-        return null;
-    }
-  };
+  if (!credentials) {
+    return <LoginScreen onLogin={(party, token) => setCredentials({ party, token })} />;
+  }
 
   return (
-    <div className="app-container">
-      <header className="app-header">
-        <h1>Canton Bond Platform</h1>
-        <div className="header-right">
-          <span className="party-info">Logged in as: <strong>{party}</strong></span>
-          <button onClick={onLogout} className="button button-secondary">Logout</button>
-        </div>
-      </header>
-      <nav className="app-nav">
-        <button
-          className={`nav-button ${activeTab === 'portfolio' ? 'active' : ''}`}
-          onClick={() => setActiveTab('portfolio')}
-        >
-          My Portfolio
-        </button>
-        <button
-          className={`nav-button ${activeTab === 'marketplace' ? 'active' : ''}`}
-          onClick={() => setActiveTab('marketplace')}
-        >
-          Marketplace
-        </button>
-        <button
-          className={`nav-button ${activeTab === 'issuer' ? 'active' : ''}`}
-          onClick={() => setActiveTab('issuer')}
-        >
-          Issuer Dashboard
-        </button>
-      </nav>
-      <main className="app-main">
-        {renderContent()}
-      </main>
-    </div>
+    <DamlLedger token={credentials.token} party={credentials.party} wsUrl={wsUrl}>
+      <MainView />
+    </DamlLedger>
   );
 };
 
-const App: React.FC = () => {
-  const [credentials, setCredentials] = useState<Credentials | null>(() => {
-    const savedCreds = localStorage.getItem('daml.credentials');
-    return savedCreds ? JSON.parse(savedCreds) : null;
-  });
 
-  useEffect(() => {
-    if (credentials) {
-      localStorage.setItem('daml.credentials', JSON.stringify(credentials));
-    } else {
-      localStorage.removeItem('daml.credentials');
-    }
-  }, [credentials]);
+// --- Inline CSS Styles ---
 
-  const handleLogin = (creds: Credentials) => {
-    setCredentials(creds);
-  };
-
-  const handleLogout = () => {
-    setCredentials(null);
-  };
-
-  if (!credentials) {
-    return <LoginScreen onLogin={handleLogin} />;
-  }
-
-  const httpBaseUrl = process.env.REACT_APP_JSON_API_URL;
-
-  return (
-    <DamlLedger party={credentials.party} token={credentials.token} httpBaseUrl={httpBaseUrl}>
-      <MainScreen onLogout={handleLogout} />
-    </DamlLedger>
-  );
+const styles: { [key: string]: React.CSSProperties } = {
+  loginContainer: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', backgroundColor: '#f0f2f5', fontFamily: 'sans-serif' },
+  loginForm: { display: 'flex', flexDirection: 'column', gap: '1rem', padding: '2rem', backgroundColor: 'white', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)', minWidth: '300px' },
+  mainContainer: { fontFamily: 'sans-serif', padding: '0 2rem', maxWidth: '1200px', margin: '0 auto' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem 0', borderBottom: '1px solid #ccc', marginBottom: '1rem' },
+  section: { marginBottom: '2rem' },
+  table: { width: '100%', borderCollapse: 'collapse', },
+  th: { borderBottom: '2px solid #ddd', padding: '12px', textAlign: 'left', backgroundColor: '#f9f9f9', fontWeight: 'bold' },
+  td: { borderBottom: '1px solid #ddd', padding: '12px', textAlign: 'left' },
+  issuanceList: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '1rem' },
+  issuanceCard: { border: '1px solid #ccc', borderRadius: '8px', padding: '1rem', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', display: 'flex', flexDirection: 'column', gap: '0.5rem' },
+  input: { padding: '0.75rem', borderRadius: '4px', border: '1px solid #ccc', width: '100%', boxSizing: 'border-box', marginBottom: '0.5rem' },
+  button: { padding: '0.75rem 1.5rem', borderRadius: '4px', border: 'none', backgroundColor: '#007bff', color: 'white', cursor: 'pointer', fontWeight: 'bold', fontSize: '1rem' },
+  buttonSecondary: { backgroundColor: '#6c757d'},
+  modalBackdrop: { position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 },
+  modalContent: { backgroundColor: 'white', padding: '2rem', borderRadius: '8px', width: '90%', maxWidth: '500px', boxShadow: '0 5px 15px rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', gap: '1rem' },
+  formActions: { display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '1rem' }
 };
 
 export default App;
