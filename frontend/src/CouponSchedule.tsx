@@ -1,154 +1,194 @@
-// Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-
 import React, { useMemo } from 'react';
-import { addMonths, isBefore, format, parseISO } from 'date-fns';
 
 /**
  * Props for the CouponSchedule component.
- * These properties define the bond for which the coupon schedule is calculated.
+ * These values typically come from a Bond template contract on the ledger.
  */
 export interface CouponScheduleProps {
-  /** The date the bond was issued, in ISO 8601 format (e.g., "2024-01-15"). */
-  issuanceDate: string;
-  /** The date the bond matures, in ISO 8601 format (e.g., "2029-01-15"). */
-  maturityDate: string;
-  /** The annual coupon rate as a decimal string (e.g., "0.05" for 5%). */
+  /** The total principal amount of the bond, e.g., "1000000.00". */
+  principal: string;
+  /** The annual coupon rate as a decimal string, e.g., "0.05" for 5%. */
   couponRate: string;
-  /** The frequency of coupon payments. */
+  /** How often coupons are paid. */
   couponFrequency: 'Annually' | 'SemiAnnually' | 'Quarterly' | 'Monthly';
-  /** The face value (or principal) of the bond as a decimal string. */
-  faceValue: string;
-  /** The currency of the bond payments (e.g., "USD", "EUR"). */
-  currency: string;
-}
-
-/** Represents a single calculated coupon payment. */
-interface CouponPayment {
-  paymentDate: Date;
-  amount: number;
+  /** The date the bond was issued, in ISO 8601 format (e.g., "2023-01-01T00:00:00Z"). */
+  issueDate: string;
+  /** The date the bond matures, in ISO 8601 format. */
+  maturityDate: string;
+  /** The currency symbol to display, defaults to 'USD'. */
+  currency?: string;
 }
 
 /**
- * Returns the number of payments per year and the month increment
- * for a given payment frequency.
- * @param frequency The coupon payment frequency.
- * @returns An object with paymentsPerYear and monthIncrement.
+ * Represents a single calculated coupon payment in the schedule.
  */
-const getPaymentInfo = (frequency: CouponScheduleProps['couponFrequency']): { paymentsPerYear: number; monthIncrement: number } => {
-  switch (frequency) {
-    case 'Annually':
-      return { paymentsPerYear: 1, monthIncrement: 12 };
-    case 'SemiAnnually':
-      return { paymentsPerYear: 2, monthIncrement: 6 };
-    case 'Quarterly':
-      return { paymentsPerYear: 4, monthIncrement: 3 };
-    case 'Monthly':
-      return { paymentsPerYear: 12, monthIncrement: 1 };
-    default:
-      // This case should be unreachable due to TypeScript's type checking
-      throw new Error(`Invalid coupon frequency: ${frequency}`);
-  }
+type CouponPayment = {
+  paymentDate: Date;
+  amount: number;
 };
 
 /**
- * Calculates the full schedule of coupon payments for a bond.
- * @param props The bond properties.
- * @returns An array of CouponPayment objects, or an empty array if inputs are invalid.
+ * A React component that calculates and displays a bond's coupon payment schedule.
+ * It takes bond parameters as props and renders a clear, formatted table of
+ * upcoming coupon payments.
  */
-const calculateCouponSchedule = ({
-  issuanceDate,
-  maturityDate,
+const CouponSchedule: React.FC<CouponScheduleProps> = ({
+  principal,
   couponRate,
   couponFrequency,
-  faceValue,
-}: CouponScheduleProps): CouponPayment[] => {
-  try {
-    const parsedIssuanceDate = parseISO(issuanceDate);
-    const parsedMaturityDate = parseISO(maturityDate);
-    const numFaceValue = parseFloat(faceValue);
-    const numCouponRate = parseFloat(couponRate);
+  issueDate,
+  maturityDate,
+  currency = 'USD',
+}) => {
 
-    // Validate parsed inputs
-    if (isNaN(parsedIssuanceDate.getTime()) || isNaN(parsedMaturityDate.getTime()) || isNaN(numFaceValue) || isNaN(numCouponRate)) {
-      console.error("Invalid props for coupon schedule calculation: one or more values could not be parsed.", { issuanceDate, maturityDate, faceValue, couponRate });
+  const schedule: CouponPayment[] = useMemo(() => {
+    const p = parseFloat(principal);
+    const r = parseFloat(couponRate);
+    const start = new Date(issueDate);
+    const end = new Date(maturityDate);
+
+    // Validate inputs to ensure calculations are safe
+    if (isNaN(p) || isNaN(r) || isNaN(start.getTime()) || isNaN(end.getTime()) || p <= 0 || r < 0) {
       return [];
     }
 
-    const { paymentsPerYear, monthIncrement } = getPaymentInfo(couponFrequency);
-    const couponAmount = (numFaceValue * numCouponRate) / paymentsPerYear;
-
-    const schedule: CouponPayment[] = [];
-    let nextPaymentDate = addMonths(parsedIssuanceDate, monthIncrement);
-
-    // Loop from the first payment date until the maturity date
-    while (isBefore(nextPaymentDate, parsedMaturityDate) || nextPaymentDate.getTime() === parsedMaturityDate.getTime()) {
-      schedule.push({
-        paymentDate: nextPaymentDate,
-        amount: couponAmount,
-      });
-      nextPaymentDate = addMonths(nextPaymentDate, monthIncrement);
+    let paymentsPerYear: number;
+    switch (couponFrequency) {
+      case 'Annually':
+        paymentsPerYear = 1;
+        break;
+      case 'SemiAnnually':
+        paymentsPerYear = 2;
+        break;
+      case 'Quarterly':
+        paymentsPerYear = 4;
+        break;
+      case 'Monthly':
+        paymentsPerYear = 12;
+        break;
+      default:
+        // This case should be unreachable with TypeScript's type checking
+        return [];
     }
 
-    return schedule;
-  } catch (error) {
-    console.error("Error calculating coupon schedule:", error);
-    return [];
-  }
-};
+    const couponAmount = (p * r) / paymentsPerYear;
+    if (couponAmount <= 0) {
+        return [];
+    }
 
-/**
- * A React component to display the calculated coupon payment schedule for a bond.
- * It takes bond parameters as props and renders a table of payment dates and amounts.
- * Styling is applied via BEM-style CSS classes, which are expected to be defined
- * in a corresponding stylesheet (e.g., CouponSchedule.css).
- *
- * This component requires the `date-fns` library for robust date calculations.
- */
-const CouponSchedule: React.FC<CouponScheduleProps> = (props) => {
-  const schedule = useMemo(() => calculateCouponSchedule(props), [
-    props.issuanceDate,
-    props.maturityDate,
-    props.couponRate,
-    props.couponFrequency,
-    props.faceValue,
-  ]);
+    const monthsIncrement = 12 / paymentsPerYear;
+    const payments: CouponPayment[] = [];
+    
+    // Start calculating from the first payment date, which is one period after the issue date.
+    let currentPaymentDate = new Date(start);
+    currentPaymentDate.setMonth(currentPaymentDate.getMonth() + monthsIncrement);
 
-  if (schedule.length === 0) {
-    return (
-      <div className="coupon-schedule coupon-schedule--empty">
-        <p>No coupon payments scheduled for this bond.</p>
-      </div>
-    );
-  }
+    // Generate payments as long as they are on or before the maturity date.
+    while (currentPaymentDate.getTime() <= end.getTime()) {
+      payments.push({
+        paymentDate: new Date(currentPaymentDate), // Clone date to avoid mutation issues
+        amount: couponAmount,
+      });
+      currentPaymentDate.setMonth(currentPaymentDate.getMonth() + monthsIncrement);
+    }
 
-  // Use Intl.NumberFormat for robust, locale-aware currency formatting
-  const currencyFormatter = new Intl.NumberFormat(navigator.language, {
-    style: 'currency',
-    currency: props.currency,
-  });
+    return payments;
+  }, [principal, couponRate, couponFrequency, issueDate, maturityDate]);
+
+  const formatDate = (date: Date): string => {
+    return date.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    });
+  };
+
+  const formatCurrency = (amount: number): string => {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+    }).format(amount);
+  };
 
   return (
-    <div className="coupon-schedule">
-      <h4 className="coupon-schedule__title">Coupon Payment Schedule</h4>
-      <table className="coupon-schedule__table">
-        <thead>
-          <tr>
-            <th scope="col">Payment Date</th>
-            <th scope="col">Coupon Amount</th>
-          </tr>
-        </thead>
-        <tbody>
-          {schedule.map((payment, index) => (
-            <tr key={index} className="coupon-schedule__row">
-              <td className="coupon-schedule__cell">{format(payment.paymentDate, 'MMMM d, yyyy')}</td>
-              <td className="coupon-schedule__cell coupon-schedule__cell--amount">
-                {currencyFormatter.format(payment.amount)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="coupon-schedule-container">
+      <h3 className="schedule-title">Coupon Payment Schedule</h3>
+      {schedule.length === 0 ? (
+        <p className="no-schedule-message">No coupon payments scheduled based on the provided bond details.</p>
+      ) : (
+        <div className="table-responsive">
+          <table className="coupon-schedule-table">
+            <thead>
+              <tr>
+                <th>Payment Date</th>
+                <th>Coupon Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              {schedule.map((payment, index) => (
+                <tr key={index}>
+                  <td>{formatDate(payment.paymentDate)}</td>
+                  <td className="amount-cell">{formatCurrency(payment.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <style jsx>{`
+        .coupon-schedule-container {
+          background-color: #f7f9fc;
+          border: 1px solid #e0e6ed;
+          border-radius: 8px;
+          padding: 1.5rem;
+          margin-top: 1rem;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        .schedule-title {
+          margin-top: 0;
+          margin-bottom: 1rem;
+          font-size: 1.25rem;
+          color: #1c2a4e;
+        }
+        .no-schedule-message {
+          color: #555;
+          font-style: italic;
+        }
+        .table-responsive {
+          overflow-x: auto;
+        }
+        .coupon-schedule-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.95rem;
+        }
+        .coupon-schedule-table th,
+        .coupon-schedule-table td {
+          padding: 0.75rem 1rem;
+          text-align: left;
+          border-bottom: 1px solid #e0e6ed;
+        }
+        .coupon-schedule-table th {
+          background-color: #e8eef6;
+          color: #334d6e;
+          font-weight: 600;
+          text-transform: uppercase;
+          font-size: 0.8rem;
+          letter-spacing: 0.05em;
+        }
+        .coupon-schedule-table tr:last-child td {
+          border-bottom: none;
+        }
+        .coupon-schedule-table tbody tr:hover {
+          background-color: #f0f4f9;
+        }
+        .amount-cell {
+          text-align: right;
+          font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+          font-weight: 500;
+          color: #27ae60;
+        }
+      `}</style>
     </div>
   );
 };
