@@ -1,120 +1,288 @@
+-- |
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
+--
 
 module BondIssuance where
 
-import DA.Date as D
+import DA.Date (Date, addDays, toDateUTC)
 import DA.Map (Map)
-import DA.Map as Map
-import DA.Time (getTime)
+import qualified DA.Map as Map
 import DA.Assert (assertMsg)
-import DA.Conversion (convert)
+import Daml.Script
 
-import Bond (BondDetails, BondHolding)
+-- | Represents the final bond asset held by an investor post-issuance.
+-- In a complete solution, this would be a more complex fungible instrument,
+-- likely defined in a separate `Bond.daml` file.
+template Bond
+  with
+    issuer: Party
+    owner: Party
+    csd: Party
+    instrument: BondInstrumentDetails
+    quantity: Decimal -- Number of bond units (e.g., 100 units)
+    acquisitionDate: Date
+    issuanceId: Text
+  where
+    signatory issuer, owner
+    observer csd
 
--- | Represents the active subscription period for a new bond issuance.
--- The Issuer creates this contract to allow Investors to subscribe to a bond
--- before it is officially issued and distributed. This contract manages the
--- subscription window, tracks subscriptions, and ensures the total issuance
--- amount is not exceeded.
+-- | Contains the static, defining terms of the bond instrument. This data
+-- is intended to be immutable throughout the bond's lifecycle.
+data BondInstrumentDetails = BondInstrumentDetails
+  with
+    isin: Text
+    description: Text
+    currency: Text
+    faceValue: Decimal -- Nominal value per unit, e.g., 1000.00
+    maturityDate: Date
+    couponRate: Decimal -- Annual rate, e.g., 0.05 for 5%
+    couponFrequency: CouponFrequency
+    firstCouponDate: Date
+    dayCountConvention: DayCountConvention
+    payingAgent: Party
+  deriving (Eq, Show)
+
+-- | Defines the frequency of coupon payments.
+data CouponFrequency = Annually | SemiAnnually | Quarterly | Monthly
+  deriving (Eq, Show)
+
+-- | Specifies the convention used to calculate accrued interest.
+data DayCountConvention = Act360 | Act365 | Thirty360
+  deriving (Eq, Show)
+
+
+-- | The primary contract representing a new bond offering during the subscription period.
+-- It manages the book-building process, allowing investors to subscribe and the agent
+-- to close the book and proceed to allocation.
 template BondIssuance
   with
-    issuer : Party
-      -- ^ The entity issuing the bond.
-    centralBank : Party
-      -- ^ The central bank or settlement authority, an observer of the process.
-    payingAgent : Party
-      -- ^ The agent responsible for future payments, an observer of the process.
-    bondDetailsCid : ContractId BondDetails
-      -- ^ Contract ID for the static details of the bond being issued.
-    issuancePrice : Decimal
-      -- ^ The price per single bond unit during this issuance.
-    subscriptionStartDate : Date
-      -- ^ The first day investors can subscribe.
-    subscriptionEndDate : Date
-      -- ^ The last day investors can subscribe.
-    maxIssuanceQuantity : Int
-      -- ^ The maximum number of bond units to be issued.
-    currentIssuanceQuantity : Int
-      -- ^ The number of bond units currently subscribed.
-    subscriptions : Map Party Int
-      -- ^ A map of investors to their subscribed quantity of bond units.
-
+    issuer: Party
+    agent: Party
+    csd: Party
+    issuanceId: Text
+    instrument: BondInstrumentDetails
+    subscriptionStartDate: Date
+    subscriptionEndDate: Date
+    settlementDate: Date
+    minSubscriptionAmount: Decimal -- In currency, not units
+    maxIssuanceAmount: Decimal -- In currency, not units
+    price: Decimal -- price per 100 face value, e.g. 99.5
+    subscribers: Map Party Decimal -- Map of investor to their subscribed amount in currency
   where
-    signatory issuer
-    observer centralBank, payingAgent
+    signatory issuer, agent
+    observer csd
 
-    key (issuer, bondDetailsCid) : (Party, ContractId BondDetails)
-    maintainer key._1
+    let currentSubscriptionAmount = sum (Map.values subscribers)
 
     ensure
-      issuancePrice > 0.0 &&
-      maxIssuanceQuantity > 0 &&
-      currentIssuanceQuantity >= 0 &&
-      currentIssuanceQuantity <= maxIssuanceQuantity &&
-      subscriptionStartDate <= subscriptionEndDate
+      subscriptionStartDate <= subscriptionEndDate &&
+      subscriptionEndDate < settlementDate &&
+      minSubscriptionAmount > 0.0 &&
+      maxIssuanceAmount >= minSubscriptionAmount &&
+      price > 0.0
 
-    -- | Allows an investor to subscribe to the bond issuance by specifying the
-    -- quantity of bond units they wish to purchase. This choice is controller
-    -- by the investor themselves.
+    -- | Allows an investor to subscribe to the bond offering.
     choice Subscribe : ContractId BondIssuance
       with
         investor : Party
-          -- ^ The party subscribing to the bond.
-        quantity : Int
-          -- ^ The number of bond units the investor wants to subscribe for.
+        amount : Decimal -- The amount in currency (e.g., USD) the investor wishes to subscribe for
+        currentTime: Time -- Passed in from script/UI to check subscription window
       controller investor
       do
-        now <- getTime
-        let today = D.date (year now) (month now) (day now)
+        let currentDate = toDateUTC currentTime
+        assertMsg "Subscription period has not yet started" (currentDate >= subscriptionStartDate)
+        assertMsg "Subscription period has ended" (currentDate <= subscriptionEndDate)
+        assertMsg "Subscription amount is below the minimum" (amount >= minSubscriptionAmount)
 
-        -- Validate that the subscription is happening within the allowed window.
-        assertMsg "Subscription period has not started yet." (today >= subscriptionStartDate)
-        assertMsg "Subscription period has ended." (today <= subscriptionEndDate)
+        let newTotalSubscription = currentSubscriptionAmount + amount
+        assertMsg "Subscription amount would exceed maximum issuance size" (newTotalSubscription <= maxIssuanceAmount)
 
-        -- Validate subscription quantity.
-        assertMsg "Subscription quantity must be positive." (quantity > 0)
-        let newTotalQuantity = currentIssuanceQuantity + quantity
-        assertMsg "Subscription exceeds the maximum issuance quantity." (newTotalQuantity <= maxIssuanceQuantity)
+        let newSubscribers = Map.insertWith (+) investor amount subscribers
+        create this with subscribers = newSubscribers
 
-        -- Update the map of subscriptions. If the investor has already subscribed,
-        -- this adds to their existing amount.
-        let newSubscriptions = Map.insert investor (Map.findWithDefault 0 investor subscriptions + quantity) subscriptions
-
-        -- Recreate the issuance contract with updated subscription data.
-        create this with
-          currentIssuanceQuantity = newTotalQuantity
-          subscriptions = newSubscriptions
-
-    -- | Executed by the issuer to finalize the issuance after the subscription period ends.
-    -- This choice archives the issuance contract and creates the individual BondHolding
-    -- contracts for each subscriber, representing their ownership of the new bonds.
-    choice CloseIssuance : ()
-      controller issuer
+    -- | Allows the agent to close the subscription book and create allocation proposals for each subscriber.
+    -- This step transitions the workflow from subscription to settlement.
+    choice CloseSubscription : ()
+      with
+        allocations: Map Party Decimal -- Agent can decide final allocations, e.g., after scaling back oversubscriptions
+      controller agent
       do
-        now <- getTime
-        let today = D.date (year now) (month now) (day now)
+        -- In a production system, this choice would be triggered by an automation bot after the
+        -- subscriptionEndDate has passed.
 
-        -- Ensure issuance can only be closed after the subscription period is over.
-        assertMsg "Cannot close issuance before the subscription period ends." (today > subscriptionEndDate)
+        -- The agent provides the final allocation map. We check that the allocated parties were subscribers
+        -- and the total allocation does not exceed the maximum size.
+        assertMsg "Total allocation cannot exceed the maximum issuance amount." (sum (Map.values allocations) <= maxIssuanceAmount)
+        assertMsg "All allocated parties must have been subscribers." (Map.keysSet allocations `DA.Set.isSubsetOf` Map.keysSet subscribers)
 
-        -- Fetch bond details needed to create the holding contracts.
-        details <- fetch bondDetailsCid
+        -- For each allocated investor, create an allocation proposal to be accepted.
+        forA_ (Map.toList allocations) \(investor, amount) -> do
+          create BondAllocationProposal with
+            issuer = this.issuer
+            agent = this.agent
+            investor = investor
+            csd = this.csd
+            issuanceId = this.issuanceId
+            instrument = this.instrument
+            price = this.price
+            settlementDate = this.settlementDate
+            settlementAmount = amount
 
-        -- Create a BondHolding contract for each subscription. This is where the
-        -- digital asset (the bond holding) is actually created and distributed to investors.
-        forA_ (Map.toList subscriptions) \(investor, quantity) -> do
-          let
-            totalFaceValue = details.faceValue * (convert @Decimal quantity)
-            totalPurchasePrice = issuancePrice * (convert @Decimal quantity)
+        archive self
 
-          create BondHolding with
-            issuer
-            investor
-            centralBank
-            payingAgent
-            bondDetailsCid
-            quantity
-            totalFaceValue
-            purchasePrice = totalPurchasePrice
-            purchaseDate = today
+    -- | Allows the issuer or agent to cancel the issuance before it is closed.
+    choice CancelIssuance : ()
+      with
+        reason: Text
+      controller issuer, agent
+      do
+        -- In a real implementation, this could create notification contracts for all subscribers.
+        archive self
+
+-- | A proposal for a specific investor's bond allocation, created after the subscription closes.
+-- The investor must accept this proposal to receive the bonds, which would typically be
+-- part of an atomic Delivery-vs-Payment (DvP) transaction.
+template BondAllocationProposal
+  with
+    issuer: Party
+    agent: Party
+    investor: Party
+    csd: Party
+    issuanceId: Text
+    instrument: BondInstrumentDetails
+    price: Decimal
+    settlementDate: Date
+    settlementAmount: Decimal -- Total cash amount to be paid
+  where
+    signatory issuer, agent
+    observer investor, csd
+
+    -- The number of bond units is derived from the settlement amount, face value, and price.
+    -- Formula: quantity = (settlementAmount * 100) / (faceValue * price)
+    let quantity = (settlementAmount * 100.0) / (instrument.faceValue * price)
+
+    -- | The investor accepts the allocation, leading to the creation of the final `Bond` contract.
+    choice AcceptAllocation : ContractId Bond
+      -- In a real DvP (Delivery vs Payment) flow, this choice would take a
+      -- ContractId of a cash asset as an argument to perform the payment atomically.
+      -- For simplicity, this example assumes payment is handled separately and
+      -- directly creates the bond contract upon acceptance.
+      controller investor
+      do
+        archive self
+        create Bond with
+          issuer = this.issuer
+          owner = this.investor
+          csd = this.csd
+          instrument = this.instrument
+          quantity = this.quantity
+          acquisitionDate = this.settlementDate
+          issuanceId = this.issuanceId
+
+    -- | The investor rejects the allocation.
+    choice RejectAllocation : ()
+      with
+        reason: Text
+      controller investor
+      do
+        -- This could create a notification contract for the issuer/agent.
+        archive self
+
+-- | A Daml Script to test the full issuance and subscription workflow.
+testIssuanceWorkflow = script do
+  issuer <- allocatePartyWithHint "IssuerCorp" (PartyIdHint "IssuerCorp")
+  agent <- allocatePartyWithHint "GlobalBank" (PartyIdHint "GlobalBank")
+  csd <- allocatePartyWithHint "CSD_Clear" (PartyIdHint "CSD_Clear")
+  investorA <- allocatePartyWithHint "InvestorA" (PartyIdHint "InvestorA")
+  investorB <- allocatePartyWithHint "InvestorB" (PartyIdHint "InvestorB")
+  payingAgent <- allocatePartyWithHint "PayingAgentBank" (PartyIdHint "PayingAgentBank")
+
+  let
+    today = DA.Date.date 2024 Feb 20
+    currentTime = time today 10 30 0
+
+    instrument = BondInstrumentDetails
+      with
+        isin = "US1234567890"
+        description = "IssuerCorp 5.0% 2034 Bond"
+        currency = "USD"
+        faceValue = 1000.0
+        maturityDate = DA.Date.date 2034 Feb 20
+        couponRate = 0.05
+        couponFrequency = SemiAnnually
+        firstCouponDate = DA.Date.date 2024 Aug 20
+        dayCountConvention = Thirty360
+        payingAgent = payingAgent
+
+    issuance = BondIssuance
+      with
+        issuer = issuer
+        agent = agent
+        csd = csd
+        issuanceId = "ISSUANCE-001"
+        instrument = instrument
+        subscriptionStartDate = today
+        subscriptionEndDate = addDays today 30
+        settlementDate = addDays today 35
+        minSubscriptionAmount = 50_000.0
+        maxIssuanceAmount = 10_000_000.0
+        price = 100.0
+        subscribers = Map.empty
+
+  -- 1. Agent and Issuer create the issuance contract
+  issuanceCid <- submitMulti [issuer, agent] [] do
+    createCmd issuance
+
+  -- 2. Investors subscribe
+  issuanceCid_A <- submit investorA do
+    exerciseCmd issuanceCid Subscribe with investor = investorA, amount = 100_000.0, currentTime
+
+  issuanceCid_B <- submit investorB do
+    exerciseCmd issuanceCid_A Subscribe with investor = investorB, amount = 250_000.0, currentTime
+
+  -- 3. Verify state after subscription
+  updatedIssuance <- queryContractId @BondIssuance investorA issuanceCid_B
+  Some updatedIssuanceData = updatedIssuance
+  updatedIssuanceData.subscribers === Map.fromList [(investorA, 100_000.0), (investorB, 250_000.0)]
+
+  -- 4. Agent closes the subscription and creates allocation proposals
+  let finalAllocations = updatedIssuanceData.subscribers
+  submit agent do
+    exerciseCmd issuanceCid_B CloseSubscription with allocations = finalAllocations
+
+  -- Issuance contract should be archived
+  queryContractId @BondIssuance agent issuanceCid_B === None
+
+  -- 5. Allocation proposals should be created for each investor
+  proposals <- query @BondAllocationProposal agent
+  filter (\(_, p) -> p.investor == investorA) proposals
+    ==> [(_proposalACid, proposalA), (_proposalACid2, proposalA2)]
+  assert (proposalA.settlementAmount == 100_000.0)
+  let proposalACid = _proposalACid
+
+  filter (\(_, p) -> p.investor == investorB) proposals
+    ==> [(_proposalBCid, proposalB)]
+  assert (proposalB.settlementAmount == 250_000.0)
+  let proposalBCid = _proposalBCid
+
+  -- 6. Investors accept their allocations
+  bondACid <- submit investorA do
+    exerciseCmd proposalACid AcceptAllocation
+
+  bondBCid <- submit investorB do
+    exerciseCmd proposalBCid AcceptAllocation
+
+  -- 7. Verify proposals are archived and bonds are created
+  queryContractId @BondAllocationProposal investorA proposalACid === None
+  queryContractId @BondAllocationProposal investorB proposalBCid === None
+
+  Some bondA <- queryContractId @Bond investorA bondACid
+  bondA.owner === investorA
+  bondA.quantity === 100.0 -- (100_000.0 * 100.0) / (1000.0 * 100.0)
+
+  Some bondB <- queryContractId @Bond investorB bondBCid
+  bondB.owner === investorB
+  bondB.quantity === 250.0 -- (250_000.0 * 100.0) / (1000.0 * 100.0)
+
+  return ()
