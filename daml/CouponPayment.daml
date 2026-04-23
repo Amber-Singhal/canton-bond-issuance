@@ -1,174 +1,192 @@
--- |
--- Module:      CouponPayment
--- Description: Daml templates and logic for bond coupon payments.
---
--- This module contains the `CouponPaymentObligation` template, representing
--- the obligation of a paying agent to pay a bond coupon to a holder.
--- It also includes helper functions for calculating coupon amounts based on
--- the 'Actual/Actual' day count convention, correctly handling leap years.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
 module CouponPayment where
 
-import DA.Assert
-import DA.Date
-import DA.Time
-import Daml.Script
+import DA.Date (Date)
+import DA.Assert (assertMsg)
 
--- | Represents an obligation for a paying agent to deliver a coupon payment
--- to a bond holder on a specified date. This contract is typically created
--- ahead of the payment date based on the bond's terms.
-template CouponPaymentObligation
+import Daml.Finance.Interface.Types.Common.Types (Account, Id)
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (I, exerciseInterfaceByKey, Split(..), Transfer(..))
+
+import Bond (I, View, Holding)
+
+-- | An instruction from the Issuer to the PayingAgent to prepare for a coupon payment.
+-- The PayingAgent will acknowledge this instruction, creating a `CouponPayment` contract
+-- that will manage the funding and disbursement process.
+template CouponPaymentInstruction
   with
-    payingAgent : Party
-      -- ^ The party responsible for making the payment.
-    bondHolder : Party
-      -- ^ The party entitled to receive the coupon payment.
-    isin: Text
-      -- ^ International Securities Identification Number of the bond.
-    couponPeriodStartDate: Date
-      -- ^ The start date of the interest accrual period for this coupon.
-    paymentDate : Date
-      -- ^ The date on which the coupon payment is due.
-    couponAmount : Decimal
-      -- ^ The calculated amount of the coupon payment.
-    currency: Text
-      -- ^ The currency of the payment (e.g., "USD").
+    issuer: Party
+      -- ^ The party issuing the bond.
+    payingAgent: Party
+      -- ^ The agent responsible for disbursing coupon payments.
+    bondCid: ContractId I
+      -- ^ The contract ID of the bond for which the coupon is being paid.
+    bondView: View
+      -- ^ The view of the bond instrument at the time of instruction.
+    paymentDate: Date
+      -- ^ The scheduled date for this coupon payment.
+    recordDate: Date
+      -- ^ The date on which bond holdings are checked to determine who receives payment.
+    couponAmountPerUnit: Decimal
+      -- ^ The calculated coupon amount for each unit of the bond's notional quantity.
+    currency: Id
+      -- ^ The identifier for the payment currency.
   where
-    signatory payingAgent
-    observer bondHolder
+    signatory issuer
+    observer payingAgent
 
-    ensure paymentDate >= couponPeriodStartDate
+    key (bondView.id, paymentDate) : (Id, Date)
+    maintainer key._1.signatories
 
-    key (payingAgent, bondHolder, isin, paymentDate) : (Party, Party, Text, Date)
-    maintainer key._1
+    ensure
+      bondView.issuer == issuer &&
+      bondView.payingAgent == some payingAgent &&
+      recordDate < paymentDate
 
-    -- | Choice exercised by the paying agent to settle the coupon payment.
-    -- In a real-world scenario, this would be part of a larger Delivery-vs-Payment
-    -- workflow, atomically exchanging the coupon obligation for a cash payment.
-    -- For simplicity, this choice just archives the obligation.
-    choice Settle : ()
+    choice Acknowledge : ContractId CouponPayment
+      -- ^ The PayingAgent acknowledges the instruction and creates the active `CouponPayment` contract.
+      with
+        payingAgentAccount: Account
+          -- ^ The account controlled by the paying agent where the issuer should send the funds.
       controller payingAgent
       do
-        -- In a production system, this would trigger a payment leg.
-        -- For example: `exercise cashCid Transfer with newOwner = bondHolder`.
-        -- Here, we simply archive the obligation to signify settlement.
-        return ()
-
--- | Determines if a given year is a leap year.
--- A year is a leap year if it is divisible by 4, except for end-of-century
--- years, which must also be divisible by 400.
-isLeapYear : Int -> Bool
-isLeapYear year =
-  (year % 4 == 0) && (year % 100 /= 0 || year % 400 == 0)
-
--- | Returns the number of days in a given year, accounting for leap years.
-daysInYear : Int -> Int
-daysInYear year =
-  if isLeapYear year then 366 else 365
-
--- | Calculates the coupon payment amount for a given period using the
--- Actual/Actual ISDA day count convention.
--- This convention correctly handles coupon periods that span across years,
--- including leap years.
---
--- Arguments:
---   periodStartDate: The start date of the coupon accrual period.
---   periodEndDate: The end date of the coupon accrual period (typically the payment date).
---   principal: The face value of the bond holding.
---   annualCouponRate: The annual interest rate of the bond (e.g., 0.05 for 5%).
-calculateActualActualCouponAmount
-  : Date      -- ^ periodStartDate
-  -> Date     -- ^ periodEndDate
-  -> Decimal  -- ^ principal
-  -> Decimal  -- ^ annualCouponRate
-  -> Decimal
-calculateActualActualCouponAmount periodStartDate periodEndDate principal annualCouponRate =
-  let
-    yearStart = year periodStartDate
-    yearEnd = year periodEndDate
-
-    yearFraction =
-      if yearStart == yearEnd then
-        -- The entire coupon period is within a single year.
         let
-          daysInPeriod = intToDecimal $ daysBetween periodStartDate periodEndDate
-          daysInCurrentYear = intToDecimal $ daysInYear yearStart
-        in
-          assertMsg "Denominator cannot be zero" (daysInCurrentYear > 0.0) $
-          daysInPeriod / daysInCurrentYear
-      else
-        -- The coupon period crosses a year boundary.
-        -- We must calculate the fraction of the period in the first year and the
-        -- fraction in the second year separately, using their respective day counts.
+          requiredAmount = bondView.quantity * couponAmountPerUnit
+        create CouponPayment with
+          issuer
+          payingAgent
+          bondCid
+          bondView
+          paymentDate
+          recordDate
+          couponAmountPerUnit
+          currency
+          requiredAmount
+          fundedAmount = 0.0
+          payingAgentAccount
+
+-- | Manages the lifecycle of a single coupon payment event.
+-- It tracks the funding status from the issuer and allows the paying agent to disburse
+-- funds to bondholders once fully funded.
+template CouponPayment
+  with
+    issuer: Party
+      -- ^ The party issuing the bond.
+    payingAgent: Party
+      -- ^ The agent responsible for disbursing coupon payments.
+    bondCid: ContractId I
+      -- ^ The contract ID of the bond for which the coupon is being paid.
+    bondView: View
+      -- ^ The view of the bond instrument.
+    paymentDate: Date
+      -- ^ The scheduled date for this coupon payment.
+    recordDate: Date
+      -- ^ The date on which bond holdings are checked to determine who receives payment.
+    couponAmountPerUnit: Decimal
+      -- ^ The coupon amount for each unit of the bond's notional quantity.
+    currency: Id
+      -- ^ The identifier for the payment currency.
+    requiredAmount: Decimal
+      -- ^ The total amount required to pay all bondholders.
+    fundedAmount: Decimal
+      -- ^ The total amount funded by the issuer so far.
+    payingAgentAccount: Account
+      -- ^ The account controlled by the paying agent where the issuer sends funds.
+  where
+    signatory payingAgent
+    observer issuer
+
+    key (bondView.id, paymentDate) : (Id, Date)
+    maintainer key._1.signatories
+
+    -- | A stakeholder can view the payment status to know if it has been funded.
+    nonconsuming choice GetStatus : (Decimal, Decimal)
+      controller issuer, payingAgent
+      do
+        return (fundedAmount, requiredAmount)
+
+    choice Fund : ContractId CouponPayment
+      -- ^ The issuer transfers funds to the paying agent for the coupon payment.
+      -- This can be done in one or more tranches.
+      with
+        amountToFund: Decimal
+        fundingCid: ContractId Fungible.I
+      controller issuer
+      do
+        assertMsg "Funding amount must be positive" $ amountToFund > 0.0
+        let newFundedAmount = fundedAmount + amountToFund
+        assertMsg "Cannot fund more than the required amount" $
+          newFundedAmount <= requiredAmount
+
+        -- Transfer the funds to the paying agent's designated account
+        Fungible.exerciseInterfaceByKey @Fungible.I issuer fundingCid
+          (Fungible.Transfer with destination = payingAgentAccount; newObservers = [])
+
+        create this with fundedAmount = newFundedAmount
+
+    choice Disburse : ()
+      -- ^ The paying agent disburses the coupon payments to all eligible bondholders.
+      -- This choice is consuming and archives the `CouponPayment` contract upon successful disbursement.
+      with
+        holdingsToPay: [ContractId Holding]
+          -- ^ A list of bond holding contracts as of the record date.
+        fundingCid: ContractId Fungible.I
+          -- ^ The fungible contract held by the paying agent containing the total payment amount.
+      controller payingAgent
+      do
+        assertMsg "Coupon payment is not fully funded" $ fundedAmount == requiredAmount
+
+        -- Verify the funding contract has the correct amount and is owned by the paying agent.
+        fundingContract <- fetch fundingCid
+        assertMsg "Incorrect funding contract provided" $
+          fundingContract.instrument == currency &&
+          fundingContract.account == payingAgentAccount &&
+          fundingContract.amount == requiredAmount
+
+        -- This recursive helper pattern processes the payment for each bondholder.
         let
-          yearBoundaryDate = fromGregorian yearEnd Jan 1
+          disburse' remainingFundingCid [] = return ()
+          disburse' currentFundingCid (holdingCid :: rest) = do
+            holding <- fetch holdingCid
+            let paymentAmount = holding.quantity * self.couponAmountPerUnit
+            if paymentAmount > 0.0 then do
+              -- Split the main fungible contract to get a piece for this specific payment
+              (paymentCid, nextFundingCid) <- exercise currentFundingCid Fungible.Split with splitAmount = paymentAmount
 
-          -- Portion of the coupon period falling in the first year.
-          daysInFirstYearPortion = intToDecimal $ daysBetween periodStartDate yearBoundaryDate
-          totalDaysInFirstYear = intToDecimal $ daysInYear yearStart
-          fractionInFirstYear =
-            assertMsg "Denominator for first year cannot be zero" (totalDaysInFirstYear > 0.0) $
-            daysInFirstYearPortion / totalDaysInFirstYear
+              -- Transfer the payment to the bondholder's account
+              Fungible.exerciseInterfaceByKey @Fungible.I self.payingAgent paymentCid
+                (Fungible.Transfer with destination = holding.ownerAccount; newObservers = [])
 
-          -- Portion of the coupon period falling in the second year.
-          daysInSecondYearPortion = intToDecimal $ daysBetween yearBoundaryDate periodEndDate
-          totalDaysInSecondYear = intToDecimal $ daysInYear yearEnd
-          fractionInSecondYear =
-            assertMsg "Denominator for second year cannot be zero" (totalDaysInSecondYear > 0.0) $
-            daysInSecondYearPortion / totalDaysInSecondYear
-        in
-          fractionInFirstYear + fractionInSecondYear
+              -- Create a receipt for the transaction
+              create CouponPaymentReceipt with
+                payingAgent = self.payingAgent
+                bondholder = holding.owner
+                bondView = self.bondView
+                paymentDate = self.paymentDate
+                paidAmount = paymentAmount
 
-  in
-    principal * annualCouponRate * yearFraction
+              -- Recurse with the remaining fungible contract and the rest of the holdings
+              disburse' nextFundingCid rest
+            else
+              -- If payment amount is zero, skip to the next holding
+              disburse' currentFundingCid rest
 
--- | Example usage of the calculation logic in a Daml Script.
--- This demonstrates how the coupon amount would be calculated and how an
--- obligation contract would be created.
-setup: Script ()
-setup = script do
-  pAgent <- allocateParty "PayingAgent"
-  bHolder <- allocateParty "BondHolder"
+        disburse' fundingCid holdingsToPay
 
-  -- Scenario 1: Coupon period within a single non-leap year (2023)
-  -- 181 days in period / 365 days in year
-  let
-    startDate1 = fromGregorian 2023 Jan 15
-    endDate1 = fromGregorian 2023 Jul 15
-    principal1 = 1_000_000.0
-    rate1 = 0.05 -- 5%
-    amount1 = calculateActualActualCouponAmount startDate1 endDate1 principal1 rate1
-  debug $ "Scenario 1 (non-leap year): " <> show amount1 -- Expected: 24794.5205479452
-
-  -- Scenario 2: Coupon period within a single leap year (2024)
-  -- 182 days in period / 366 days in year
-  let
-    startDate2 = fromGregorian 2024 Jan 15
-    endDate2 = fromGregorian 2024 Jul 15
-    principal2 = 1_000_000.0
-    rate2 = 0.05 -- 5%
-    amount2 = calculateActualActualCouponAmount startDate2 endDate2 principal2 rate2
-  debug $ "Scenario 2 (leap year): " <> show amount2 -- Expected: 24863.3879781421
-
-  -- Scenario 3: Coupon period crossing from a non-leap (2023) to a leap year (2024)
-  -- (47 days / 365) + (135 days / 366)
-  let
-    startDate3 = fromGregorian 2023 Nov 15
-    endDate3 = fromGregorian 2024 May 15
-    principal3 = 1_000_000.0
-    rate3 = 0.05 -- 5%
-    amount3 = calculateActualActualCouponAmount startDate3 endDate3 principal3 rate3
-  debug $ "Scenario 3 (crossing year boundary): " <> show amount3 -- Expected: 24880.9944204478
-
-  -- Create a sample obligation contract
-  _ <- submit pAgent do
-    createCmd CouponPaymentObligation with
-      payingAgent = pAgent
-      bondHolder = bHolder
-      isin = "US000TEST000"
-      couponPeriodStartDate = startDate3
-      paymentDate = endDate3
-      couponAmount = amount3
-      currency = "USD"
-
-  return ()
+-- | A record of a successfully disbursed coupon payment to a single bondholder.
+template CouponPaymentReceipt
+  with
+    payingAgent: Party
+      -- ^ The party that made the payment.
+    bondholder: Party
+      -- ^ The party that received the payment.
+    bondView: View
+      -- ^ A snapshot of the bond's data at the time of payment.
+    paymentDate: Date
+      -- ^ The date the coupon was paid.
+    paidAmount: Decimal
+      -- ^ The amount paid to the bondholder.
+  where
+    signatory payingAgent
+    observer bondholder
