@@ -1,105 +1,127 @@
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-module Redemption where
+module Daml.Finance.Redemption where
 
 import Daml.Script
-import DA.Date
-import DA.Time
-import DA.Assert
-import Bond (Bond(..))
 
--- | A request from a bond holder to the paying agent to redeem their bond holding at maturity.
--- | This is typically created by the investor on or after the bond's maturity date.
-template RedemptionRequest
+import DA.Assert (assertMsg, (===))
+import DA.Date (Date, toDateUTC)
+import DA.Time (Time, getTime)
+import DA.Set (singleton)
+import DA.Optional (isSome)
+
+import Daml.Finance.Interface.Types.Common.Types (Account(..), Id(..))
+import Daml.Finance.Interface.Holding.V1 qualified as Holding (F, Transfer(..))
+import Daml.Finance.Lifecycle.Event.V1 qualified as Event (Redemption(..), Event(..))
+
+-- | Represents the issuer's proposal to redeem a specific bond holding from an investor at maturity.
+-- | This is typically created by an automated process (e.g., a trigger) on or after the maturity date.
+template RedemptionProposal
   with
-    issuer : Party
-      -- ^ The original issuer of the bond.
-    investor : Party
-      -- ^ The current owner of the bond requesting redemption.
-    payingAgent : Party
-      -- ^ The party responsible for processing the redemption payment.
-    bondCid : ContractId Bond
-      -- ^ The contract ID of the bond to be redeemed.
-    bondIsin : Text
-      -- ^ The ISIN identifier of the bond.
-    faceValue : Decimal
-      -- ^ The principal amount to be returned at maturity.
-    currency : Text
-      -- ^ The currency of the face value.
-    maturityDate : Date
-      -- ^ The maturity date of the bond.
+    issuer        : Party                 -- ^ The party proposing the redemption (bond issuer).
+    investor      : Party                 -- ^ The bond holder.
+    bondHoldingCid: ContractId Holding.F  -- ^ The investor's bond holding to be redeemed.
+    redemptionAmount: Decimal             -- ^ The principal amount to be paid back.
+    currency      : Text                  -- ^ The currency of the redemption amount.
+    maturityDate  : Date                  -- ^ The bond's maturity date.
+    id            : Id                    -- ^ A unique identifier for this redemption event.
+    payingAgent   : Party                 -- ^ The agent responsible for facilitating the payment.
+    observers     : Map Text [Party]      -- ^ Observers for this proposal.
+  where
+    signatory issuer
+    observer investor, payingAgent
+
+    key (issuer, investor, id) : (Party, Party, Id)
+    maintainer key._1
+
+    -- | The investor accepts the redemption proposal. This creates an allocation of their bond
+    -- | holding, which can then be settled against a cash payment in a DvP (Delivery vs Payment) transaction.
+    choice Accept : ContractId RedemptionAllocation
+      controller investor
+      do
+        now <- getTime
+        let today = toDateUTC now
+
+        -- Ensure the bond has actually reached or passed its maturity date before redemption.
+        assertMsg
+          ("Cannot accept redemption proposal before bond maturity date: " <> show maturityDate)
+          (maturityDate <= today)
+
+        -- Create the RedemptionAllocation contract. This contract represents the investor's
+        -- commitment to deliver the bond upon receiving the redemption amount.
+        create RedemptionAllocation with
+          issuer
+          investor
+          bondHoldingCid
+          redemptionAmount
+          currency
+          payingAgent
+          id
+          observers
+
+-- | Represents the investor's commitment to deliver their bond holding in exchange for the
+-- | redemption amount. This contract is the "delivery" leg of the DvP settlement. It is created
+-- | when the investor accepts a `RedemptionProposal`.
+template RedemptionAllocation
+  with
+    issuer        : Party                 -- ^ The party who will receive the bond and pay cash.
+    investor      : Party                 -- ^ The party who will deliver the bond and receive cash.
+    bondHoldingCid: ContractId Holding.F  -- ^ The specific bond holding allocated for redemption.
+    redemptionAmount: Decimal             -- ^ The cash amount expected in return for the bond.
+    currency      : Text                  -- ^ The currency of the expected payment.
+    payingAgent   : Party                 -- ^ The agent facilitating the settlement.
+    id            : Id                    -- ^ The unique identifier for this redemption event.
+    observers     : Map Text [Party]      -- ^ Observers for this allocation.
   where
     signatory investor
-    observer payingAgent
+    observer issuer, payingAgent
 
-    key (investor, bondIsin) : (Party, Text)
+    key (issuer, investor, id) : (Party, Party, Id)
     maintainer key._1
 
-    -- | The paying agent confirms and processes the redemption.
-    -- | In a real-world scenario, this choice would be part of a larger Delivery-vs-Payment (DvP)
-    -- | workflow, where the bond asset is atomically swapped for a cash-equivalent token.
-    -- | For simplicity, this choice creates a confirmation record, assuming payment is handled
-    -- | by an external process or a separate DvP contract.
-    choice ProcessRedemption : ContractId RedemptionConfirmation
+    -- | Atomically settles the redemption. The paying agent or issuer provides a cash holding, and the
+    -- | bond holding is transferred to the issuer in the same transaction, ensuring DvP.
+    choice Settle : ContractId Event.Event
+      controller payingAgent, issuer
       with
-        -- | The effective date of the redemption payment.
-        redemptionDate : Date
-      controller payingAgent
+        cashHoldingCid: ContractId Holding.F -- ^ The cash holding used for payment.
       do
-        -- Fetch the bond contract to verify its current state
-        bond <- fetch bondCid
+        -- Fetch the contracts involved in the settlement.
+        cashHolding <- fetch cashHoldingCid
+        bondHolding <- fetch bondHoldingCid
 
-        -- Ensure the redemption is happening at or after maturity by checking ledger time
-        now <- getTime
-        assertMsg "Cannot process redemption before the bond's maturity date." (toDateUTC now >= maturityDate)
+        -- Validate the settlement parameters.
+        cashHolding.instrument.id.label === currency
+          "Settlement currency does not match the required redemption currency."
+        cashHolding.amount === redemptionAmount
+          "Provided cash amount does not match the required redemption amount."
+        assertMsg "Cash for settlement must be owned by the issuer or the paying agent."
+          (cashHolding.account.owner == issuer || cashHolding.account.owner == payingAgent)
+        bondHolding.account.owner === investor
+          "Bond being redeemed must be owned by the investor."
 
-        -- Validate the provided redemption date
-        assertMsg "Redemption date cannot be before the bond's maturity date." (redemptionDate >= maturityDate)
+        -- Execute the atomic DvP transfer using the standard Holding.Transfer choice.
+        -- 1. Transfer bond from investor to issuer. The bond is effectively returned.
+        let issuerAccount = Account with owner = issuer, id = bondHolding.account.id, signatories = singleton issuer
+        exercise bondHoldingCid Holding.Transfer with
+          newOwnerAccount = issuerAccount
+          amountToTransfer = bondHolding.amount
 
-        -- Verify the controller is the correct paying agent for this bond
-        assertMsg "Controller is not the designated paying agent for this bond." (payingAgent == bond.payingAgent)
+        -- 2. Transfer cash from issuer/paying agent to investor for the principal.
+        let investorAccount = Account with owner = investor, id = cashHolding.account.id, signatories = singleton investor
+        exercise cashHoldingCid Holding.Transfer with
+          newOwnerAccount = investorAccount
+          amountToTransfer = redemptionAmount
 
-        -- Verify the investor on the request is the current owner of the bond
-        assertMsg "The requesting party is not the current owner of the bond." (investor == bond.owner)
-
-        -- Create a confirmation record of the redemption
-        confirmationCid <- create RedemptionConfirmation with
-          issuer = issuer
-          investor = investor
-          payingAgent = payingAgent
-          bondIsin = bondIsin
-          redemptionAmount = faceValue
-          currency = currency
-          redemptionDate = redemptionDate
-
-        -- The request is consumed upon processing. The Bond contract itself is not archived here;
-        -- it would typically be archived as the 'delivery' leg in a DvP settlement.
-        archive self
-
-        return confirmationCid
-
--- | An immutable record confirming that a bond's principal (face value) has been returned
--- | to the investor upon maturity. This serves as a verifiable receipt for all parties.
-template RedemptionConfirmation
-  with
-    issuer : Party
-      -- ^ The original issuer of the bond.
-    investor : Party
-      -- ^ The investor who received the redemption payment.
-    payingAgent : Party
-      -- ^ The agent who processed the payment.
-    bondIsin : Text
-      -- ^ The ISIN of the redeemed bond.
-    redemptionAmount : Decimal
-      -- ^ The principal amount returned.
-    currency : Text
-      -- ^ The currency of the payment.
-    redemptionDate : Date
-      -- ^ The date the redemption was processed.
-  where
-    signatory payingAgent, investor
-    observer issuer
-
-    key (investor, bondIsin) : (Party, Text)
-    maintainer key._1
+        -- Create a lifecycle event to record the successful redemption for audit and tracking.
+        eventTime <- getTime
+        create Event.Event with
+          id
+          eventTime
+          payload = Event.Redemption Event.Redemption with
+            issuer
+            investor
+            instrument = bondHolding.instrument
+            amount = redemptionAmount
+          observers
