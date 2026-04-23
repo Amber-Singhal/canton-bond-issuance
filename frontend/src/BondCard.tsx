@@ -1,63 +1,62 @@
 import React from 'react';
-import {
-  Box,
-  Button,
-  Card,
-  CardActions,
-  CardContent,
-  Chip,
-  Grid,
-  Typography,
-  Divider,
-} from '@mui/material';
-import { green, grey, blue } from '@mui/material/colors';
+import { format, isAfter } from 'date-fns';
+import { CouponSchedule } from './CouponSchedule';
 
-// This interface should align with the structure of the bond contract data
-// fetched from the Daml ledger, likely via the JSON API and codegen types.
-export interface BondData {
-  contractId: string;
-  payload: {
-    isin: string;
-    issuer: string;
-    description: string;
-    currency: string;
-    faceValue: string; // Decimal as string
-    couponRate: string; // Decimal as string
-    maturityDate: string; // ISO Date string e.g., "2034-08-15"
-    issuanceEndDate: string; // ISO Date string
-    nextCouponDate?: string; // Optional, may not exist if matured
-    // In a real-world scenario, YTM would be calculated by a pricing engine.
-    // Here we assume it's provided for simplicity.
-    yieldToMaturity: string;
-  };
+// --- Type Definitions (mirroring Daml templates) ---
+
+/**
+ * Represents the status of the bond throughout its lifecycle.
+ */
+export type BondStatus = "Issuing" | "Active" | "Redeemed";
+
+/**
+ * Represents the data payload of a bond contract on the ledger.
+ * Fields are strings as they come from the JSON API.
+ */
+export interface Bond {
+  isin: string;
+  description: string;
+  currency: string;
+  faceValue: string;      // Daml Decimal as string
+  couponRate: string;     // Daml Decimal as string
+  maturityDate: string;   // Daml Date as string "YYYY-MM-DD"
+  couponDates: string[];  // Array of Daml Dates as strings
+  status: BondStatus;
 }
+
+// --- Props Interface ---
 
 interface BondCardProps {
-  bond: BondData;
-  onSubscribe: (contractId: string) => void;
-  onViewDetails: (contractId: string) => void;
+  bond: Bond;
 }
 
-// Helper to determine the bond's current lifecycle status
-const getBondStatus = (issuanceEndDateStr: string, maturityDateStr: string): { label: 'Issuance' | 'Active' | 'Matured'; color: string } => {
-  const now = new Date();
-  const issuanceEndDate = new Date(issuanceEndDateStr);
-  const maturityDate = new Date(maturityDateStr);
-  
-  // Set time to end of day for accurate date comparisons
-  now.setHours(23, 59, 59, 999);
-  issuanceEndDate.setHours(23, 59, 59, 999);
-  maturityDate.setHours(23, 59, 59, 999);
+// --- Helper Functions ---
 
-  if (now.getTime() < issuanceEndDate.getTime()) {
-    return { label: 'Issuance', color: blue[500] };
-  } else if (now.getTime() < maturityDate.getTime()) {
-    return { label: 'Active', color: green[500] };
-  } else {
-    return { label: 'Matured', color: grey[600] };
+/**
+ * Finds the next upcoming coupon date from a list of dates.
+ * @param couponDates - An array of date strings in "YYYY-MM-DD" format.
+ * @param status - The current status of the bond.
+ * @returns The next coupon date as a string, or null if none are upcoming or the bond is not active.
+ */
+const getNextCouponDate = (couponDates: string[], status: BondStatus): string | null => {
+  if (status !== 'Active') {
+    return null;
   }
+  const now = new Date();
+  // Ensure we compare dates only, ignoring time part
+  now.setHours(0, 0, 0, 0);
+
+  const futureDates = couponDates
+    .map(dateStr => new Date(dateStr))
+    .filter(date => isAfter(date, now) || date.getTime() === now.getTime()) // Include today
+    .sort((a, b) => a.getTime() - b.getTime());
+
+  return futureDates.length > 0 ? format(futureDates[0], 'yyyy-MM-dd') : null;
 };
 
+/**
+ * Formats a numeric string as a currency value.
+ */
 const formatCurrency = (amount: string, currency: string) => {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -67,83 +66,88 @@ const formatCurrency = (amount: string, currency: string) => {
   }).format(Number(amount));
 };
 
+/**
+ * Formats a rate string (e.g., "0.0525") as a percentage.
+ */
 const formatPercent = (rate: string) => {
   return `${(Number(rate) * 100).toFixed(2)}%`;
 };
 
-const formatDate = (dateString: string) => {
-  return new Date(dateString).toLocaleDateString(undefined, {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  });
-};
+// --- Sub-components ---
 
-const BondCard: React.FC<BondCardProps> = ({ bond, onSubscribe, onViewDetails }) => {
-  const { payload } = bond;
-  const status = getBondStatus(payload.issuanceEndDate, payload.maturityDate);
-
-  const handleActionClick = () => {
-    if (status.label === 'Issuance') {
-      onSubscribe(bond.contractId);
-    } else {
-      onViewDetails(bond.contractId);
-    }
+const StatusTag: React.FC<{ status: BondStatus }> = ({ status }) => {
+  const statusStyles: Record<BondStatus, string> = {
+    Issuing: 'bg-blue-100 text-blue-800 border-blue-200',
+    Active: 'bg-green-100 text-green-800 border-green-200',
+    Redeemed: 'bg-gray-100 text-gray-800 border-gray-200',
   };
 
   return (
-    <Card variant="outlined" sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <CardContent sx={{ flexGrow: 1 }}>
-        <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-          <Typography variant="h6" component="h2" noWrap>
-            {payload.description}
-          </Typography>
-          <Chip label={status.label} sx={{ backgroundColor: status.color, color: 'white' }} size="small" />
-        </Box>
+    <span
+      className={`px-2.5 py-1 text-xs font-semibold rounded-full border ${statusStyles[status]}`}
+    >
+      {status.toUpperCase()}
+    </span>
+  );
+};
 
-        <Typography variant="body2" color="text.secondary" gutterBottom>
-          ISIN: {payload.isin}
-        </Typography>
+interface MetricProps {
+  label: string;
+  value: string;
+}
 
-        <Divider sx={{ my: 2 }} />
+const Metric: React.FC<MetricProps> = ({ label, value }) => (
+  <div>
+    <p className="text-sm text-gray-500">{label}</p>
+    <p className="text-lg font-semibold text-gray-900">{value}</p>
+  </div>
+);
 
-        <Grid container spacing={2}>
-          <Grid item xs={6} sm={4}>
-            <Typography variant="caption" color="text.secondary">Yield to Maturity</Typography>
-            <Typography variant="body1" fontWeight="bold">{formatPercent(payload.yieldToMaturity)}</Typography>
-          </Grid>
-          <Grid item xs={6} sm={4}>
-            <Typography variant="caption" color="text.secondary">Coupon Rate</Typography>
-            <Typography variant="body1">{formatPercent(payload.couponRate)}</Typography>
-          </Grid>
-          <Grid item xs={6} sm={4}>
-            <Typography variant="caption" color="text.secondary">Face Value</Typography>
-            <Typography variant="body1">{formatCurrency(payload.faceValue, payload.currency)}</Typography>
-          </Grid>
-          <Grid item xs={6} sm={4}>
-            <Typography variant="caption" color="text.secondary">Maturity</Typography>
-            <Typography variant="body1">{formatDate(payload.maturityDate)}</Typography>
-          </Grid>
-          <Grid item xs={6} sm={8}>
-            <Typography variant="caption" color="text.secondary">Next Coupon</Typography>
-            <Typography variant="body1">
-              {payload.nextCouponDate ? formatDate(payload.nextCouponDate) : 'N/A'}
-            </Typography>
-          </Grid>
-        </Grid>
 
-      </CardContent>
-      <CardActions sx={{ borderTop: `1px solid ${grey[200]}`, p: 2 }}>
-        <Button
-          fullWidth
-          variant="contained"
-          onClick={handleActionClick}
-          disabled={status.label === 'Matured'}
-        >
-          {status.label === 'Issuance' ? 'Subscribe' : 'View Details'}
-        </Button>
-      </CardActions>
-    </Card>
+// --- Main Component ---
+
+/**
+ * A card component that displays the key details of a digital bond.
+ */
+export const BondCard: React.FC<BondCardProps> = ({ bond }) => {
+  const {
+    isin,
+    description,
+    currency,
+    faceValue,
+    couponRate,
+    maturityDate,
+    couponDates,
+    status,
+  } = bond;
+
+  const nextCouponDate = getNextCouponDate(couponDates, status);
+
+  return (
+    <div className="bg-white rounded-lg shadow-md border border-gray-200 p-6 max-w-2xl mx-auto my-4 transition-shadow hover:shadow-lg">
+      <header className="flex justify-between items-start mb-4">
+        <div>
+          <h2 className="text-xl font-bold text-gray-800">{description}</h2>
+          <p className="text-sm text-gray-500 font-mono tracking-wider">{isin}</p>
+        </div>
+        <StatusTag status={status} />
+      </header>
+
+      <section className="grid grid-cols-2 md:grid-cols-4 gap-y-4 gap-x-6 mb-6 border-t border-b border-gray-200 py-4">
+        <Metric label="Face Value" value={formatCurrency(faceValue, currency)} />
+        <Metric label="Coupon Yield" value={formatPercent(couponRate)} />
+        <Metric label="Maturity" value={format(new Date(maturityDate), 'dd MMM yyyy')} />
+        <Metric
+          label="Next Coupon"
+          value={nextCouponDate ? format(new Date(nextCouponDate), 'dd MMM yyyy') : 'N/A'}
+        />
+      </section>
+
+      <section>
+        <h3 className="text-md font-semibold text-gray-700 mb-2">Coupon Payment Schedule</h3>
+        <CouponSchedule couponDates={couponDates} />
+      </section>
+    </div>
   );
 };
 
